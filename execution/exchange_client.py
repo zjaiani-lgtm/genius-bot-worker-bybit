@@ -82,12 +82,11 @@ class UnifiedClient:
                 "apiKey": api_key,
                 "secret": api_secret,
                 "enableRateLimit": True,
-                "options": {"defaultType": "spot"},  # your code is spot-only
+                "options": {"defaultType": "spot"},  # spot-only here
             })
 
             # TESTNET handling
             if self.mode == "TESTNET":
-                # For Binance spot testnet, override REST base (works well)
                 ex.urls["api"] = {
                     "public": self.BINANCE_TESTNET_REST_BASE,
                     "private": self.BINANCE_TESTNET_REST_BASE,
@@ -104,21 +103,15 @@ class UnifiedClient:
                 if not api_key or not api_secret:
                     raise ExchangeClientError("Missing BYBIT_API_KEY / BYBIT_API_SECRET for LIVE/TESTNET.")
 
-            # MARKET_TYPE:
-            #  - spot => Bybit spot
-            #  - swap => USDT perpetuals (recommended for your TP/SL-first architecture)
             default_type = "swap" if self.market_type == "swap" else "spot"
 
             ex = ccxt.bybit({
                 "apiKey": api_key,
                 "secret": api_secret,
                 "enableRateLimit": True,
-                "options": {
-                    "defaultType": default_type,
-                }
+                "options": {"defaultType": default_type},
             })
 
-            # ccxt sandbox mode (Bybit testnet supported)
             if self.mode == "TESTNET":
                 try:
                     ex.set_sandbox_mode(True)
@@ -191,12 +184,10 @@ class UnifiedClient:
         try:
             m = self.exchange.market(symbol)
 
-            # 1) ccxt normalized
             cost_min = (((m.get("limits") or {}).get("cost") or {}).get("min"))
             if cost_min is not None:
                 return float(cost_min)
 
-            # 2) Binance raw filters only
             if self.exchange_name == "binance":
                 info = m.get("info") or {}
                 filters = info.get("filters") or []
@@ -216,7 +207,7 @@ class UnifiedClient:
         return 0.0
 
     # ----------------------------
-    # Precision helpers (STRING!)
+    # Precision helpers
     # ----------------------------
     def floor_amount(self, symbol: str, amount: float) -> float:
         try:
@@ -244,7 +235,7 @@ class UnifiedClient:
     def place_market_buy_by_quote(self, symbol: str, quote_amount: float) -> Dict[str, Any]:
         """
         Binance spot: uses quoteOrderQty (best)
-        Bybit: calculates base qty = quote_amount / last_price (because quoteOrderQty is not Binance-standard there)
+        Bybit: calculates base qty = quote_amount / last_price
         """
         self._guard(symbol, quote_amount=quote_amount)
         try:
@@ -252,7 +243,6 @@ class UnifiedClient:
                 params = {"quoteOrderQty": float(quote_amount)}
                 return self.exchange.create_order(symbol, "market", "buy", None, None, params)
 
-            # Bybit (spot/swap): calculate base amount
             last = self.fetch_last_price(symbol)
             if last <= 0:
                 raise ExchangeClientError("Invalid last price for sizing.")
@@ -263,7 +253,6 @@ class UnifiedClient:
             if base_amount <= 0:
                 raise ExchangeClientError("Computed base amount <= 0 after precision flooring.")
 
-            # market buy in base units
             return self.exchange.create_order(symbol, "market", "buy", float(base_amount), None, {})
 
         except LiveTradingBlocked:
@@ -281,13 +270,14 @@ class UnifiedClient:
         except Exception as e:
             raise ExchangeClientError(f"Market sell failed: {e}")
 
-    def place_limit_sell_amount(self, symbol: str, base_amount: float, price: float, reduce_only: bool = False) -> Dict[str, Any]:
+    def place_limit_sell_amount(
+        self, symbol: str, base_amount: float, price: float, reduce_only: bool = False
+    ) -> Dict[str, Any]:
         self._guard(symbol)
         try:
             amt = float(self.exchange.amount_to_precision(symbol, base_amount))
             px = float(self.exchange.price_to_precision(symbol, price))
             params = {}
-            # Bybit swap: reduceOnly makes sense
             if reduce_only:
                 params["reduceOnly"] = True
             return self.exchange.create_order(symbol, "limit", "sell", float(amt), float(px), params)
@@ -299,7 +289,6 @@ class UnifiedClient:
     def place_stop_loss_limit_sell(self, symbol: str, base_amount: float, stop_price: float, limit_price: float) -> Dict[str, Any]:
         """
         Binance-only STOP_LOSS_LIMIT in spot.
-        For Bybit, use place_stop_loss_market_sell() below (more reliable in perp).
         """
         self._guard(symbol)
         if self.exchange_name != "binance":
@@ -317,24 +306,14 @@ class UnifiedClient:
 
     def place_stop_loss_market_sell(self, symbol: str, base_amount: float, stop_price: float, reduce_only: bool = True) -> Dict[str, Any]:
         """
-        Cross-exchange best practice for futures:
-        place a STOP (trigger) that executes a market sell.
-        NOTE: stop/trigger params differ per exchange; ccxt maps many, but not all, consistently.
-        This version works for Bybit v5 in many setups.
+        Futures-friendly stop market.
         """
         self._guard(symbol)
         try:
             amt = float(self.exchange.amount_to_precision(symbol, base_amount))
             trigger = float(self.exchange.price_to_precision(symbol, stop_price))
-            params = {"reduceOnly": bool(reduce_only)}
-
-            # ccxt common trigger keys (Bybit uses triggerPrice)
-            params["triggerPrice"] = trigger
-
-            # Some accounts need triggerDirection (1=rise, 2=fall) for certain order types.
-            # For SL on a long position, trigger is typically "fall" -> 2
-            params.setdefault("triggerDirection", 2)
-
+            params = {"reduceOnly": bool(reduce_only), "triggerPrice": trigger}
+            params.setdefault("triggerDirection", 2)  # fall for SL on long
             return self.exchange.create_order(symbol, "market", "sell", float(amt), None, params)
         except LiveTradingBlocked:
             raise
@@ -346,13 +325,13 @@ class UnifiedClient:
     # ----------------------------
     def place_oco_sell(self, symbol: str, base_amount: float, tp_price: float, sl_stop_price: float, sl_limit_price: float) -> Dict[str, Any]:
         """
-        Native Binance Spot OCO (single reserve).
+        Native Binance Spot OCO.
         IMPORTANT: use STRING precision to avoid -1111 precision errors.
         """
         self._guard(symbol)
 
         if self.exchange_name != "binance":
-            raise ExchangeClientError("Native OCO is Binance-spot only. Use place_tp_sl_orders() for Bybit.")
+            raise ExchangeClientError("Native OCO is Binance-spot only. Use place_tp_sl_orders_for_long() for Bybit.")
 
         try:
             qty = self._amount_str(symbol, base_amount)
@@ -389,9 +368,7 @@ class UnifiedClient:
     ) -> Dict[str, Any]:
         """
         For Bybit (and generally futures): place TP limit sell + SL stop-market sell (reduceOnly).
-
-        Returns:
-          {"tp": <order>, "sl": <order>}
+        Returns: {"tp": <order>, "sl": <order>}
         """
         self._guard(symbol)
         try:
@@ -399,13 +376,11 @@ class UnifiedClient:
             tp_px = float(self.exchange.price_to_precision(symbol, tp_price))
             sl_trigger = float(self.exchange.price_to_precision(symbol, sl_stop_price))
 
-            # Take profit (limit, reduceOnly)
             tp = self.exchange.create_order(
                 symbol, "limit", "sell", float(amt), float(tp_px),
                 {"reduceOnly": True}
             )
 
-            # Stop loss (trigger -> market, reduceOnly)
             sl = self.exchange.create_order(
                 symbol, "market", "sell", float(amt), None,
                 {
@@ -427,3 +402,11 @@ def get_exchange_client() -> UnifiedClient:
     Factory function for the rest of your codebase.
     """
     return UnifiedClient()
+
+
+# ------------------------------------------------------------
+# ✅ Backward compatibility (fixes your ImportError immediately)
+# ------------------------------------------------------------
+# Old code expects: from execution.exchange_client import BinanceSpotClient
+# We keep it as an alias to UnifiedClient.
+BinanceSpotClient = UnifiedClient
