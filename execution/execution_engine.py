@@ -216,10 +216,12 @@ class ExecutionEngine:
             return
 
         # last-millisecond kill switch
+                # last-millisecond kill switch
         if is_kill_switch_active():
             logger.error(f"KILL_SWITCH_ACTIVE_LAST_GATE | SELL_BLOCKED | id={signal_id} symbol={symbol}")
-                        log_event("SELL_BLOCKED_KILL_SWITCH_LAST_GATE", f"{signal_id} {symbol}")
+            log_event("SELL_BLOCKED_KILL_SWITCH_LAST_GATE", f"{signal_id} {symbol}")
             return
+
 
         # 1) Cancel active OCO (if any)
         rows = list_active_oco_links(50)
@@ -612,5 +614,6 @@ class ExecutionEngine:
             logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
             log_event("EXEC_LIVE_ERROR", f"{signal_id} err={e}")
             return
+
 
 
