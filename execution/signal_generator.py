@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any, List
 import ccxt
 
 from execution.signal_client import append_signal
-from execution.db.repository import has_active_oco_for_symbol
+from execution.db.repository import has_active_oco_for_symbol, log_event
 from execution.excel_live_core import ExcelLiveCore, CoreInputs
 
 logger = logging.getLogger("gbm")
@@ -33,6 +33,30 @@ _last_emit_ts: float = 0.0
 EXCHANGE_FEED = ccxt.binance({"enableRateLimit": True})
 
 _CORE: Optional[ExcelLiveCore] = None
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name, "true" if default else "false").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
+# --- Adaptive Confidence Gate (Phase 1) ---
+ADAPTIVE_CONFIDENCE_ENABLED = _env_bool("ADAPTIVE_CONFIDENCE_ENABLED", False)
+ADAPTIVE_CONF_LOW_VOL_DELTA = float(os.getenv("ADAPTIVE_CONF_LOW_VOL_DELTA", "-0.005"))
+ADAPTIVE_CONF_HIGH_VOL_DELTA = float(os.getenv("ADAPTIVE_CONF_HIGH_VOL_DELTA", "0.005"))
+
+
+def get_adaptive_buy_threshold(base: float, vol_reg: str) -> float:
+    if not ADAPTIVE_CONFIDENCE_ENABLED:
+        return float(base)
+
+    vr = str(vol_reg or "").upper()
+    if vr == "LOW":
+        return float(base) + float(ADAPTIVE_CONF_LOW_VOL_DELTA)
+    if vr in ("HIGH", "EXTREME"):
+        return float(base) + float(ADAPTIVE_CONF_HIGH_VOL_DELTA)
+
+    return float(base)
 
 
 def _now_utc_iso() -> str:
@@ -103,11 +127,10 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
     v20 = sma(vols, 20)
     vlast = vols[-1]
 
-    # ---- feature engineering (0..1 normalized) ----
     # trend_strength: how far above MA20 (scaled)
     trend_strength = 0.0
     if ma20 > 0:
-        trend_strength = _clamp(((last - ma20) / ma20) * 10.0, 0.0, 1.0)  # 1% above -> 0.10, 10% above -> 1.0
+        trend_strength = _clamp(((last - ma20) / ma20) * 10.0, 0.0, 1.0)
 
     # structure_ok: simple structure confirmation
     structure_ok = (last > ma20) and (last > prev) and (ma20 >= ma50)
@@ -115,7 +138,7 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
     # volume_score: last volume vs avg20
     volume_score = 0.5
     if v20 > 0:
-        volume_score = _clamp(vlast / v20, 0.0, 1.5) / 1.5  # normalize into 0..1
+        volume_score = _clamp(vlast / v20, 0.0, 1.5) / 1.5
 
     # volatility_regime: ATR-ish proxy via avg abs returns
     rets = []
@@ -160,7 +183,6 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
 def _make_signal(symbol: str, snap: Dict[str, Any], excel_out: Dict[str, Any]) -> Dict[str, Any]:
     signal_id = f"GBM-{uuid.uuid4().hex[:12]}"
 
-    # excel_out from decide(): final_trade_decision EXECUTE/STAND_BY
     final_decision = str(excel_out.get("final_trade_decision") or "").upper()
     verdict = "BUY" if final_decision == "EXECUTE" else "HOLD"
 
@@ -180,7 +202,6 @@ def _make_signal(symbol: str, snap: Dict[str, Any], excel_out: Dict[str, Any]) -
         "excel_out": excel_out,
     }
 
-    # IMPORTANT: execution_engine checks certified_signal=True
     return {
         "signal_id": signal_id,
         "final_verdict": verdict,
@@ -204,6 +225,8 @@ def generate_signal(symbols_override: Optional[List[str]] = None) -> Optional[Di
         logger.warning("GEN | no symbols configured (BOT_SYMBOLS/SYMBOL_WHITELIST empty)")
         return None
 
+    base_min = float(os.getenv("BUY_CONFIDENCE_MIN", "0.55"))
+
     for symbol in symbols:
         try:
             if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and has_active_oco_for_symbol(symbol):
@@ -222,16 +245,39 @@ def generate_signal(symbols_override: Optional[List[str]] = None) -> Optional[Di
             )
 
             excel_out = _core().decide(inp)
-
             final_decision = str(excel_out.get("final_trade_decision") or "").upper()
+
+            # --- Adaptive confidence wrapper (institutional-safe) ---
+            confidence = float(snap.get("confidence_score") or 0.0)
+            vol_reg = str(snap.get("volatility_regime") or "NORMAL").upper()
+            adaptive_min = get_adaptive_buy_threshold(base_min, vol_reg)
+            passes_adaptive = confidence >= adaptive_min
+
             logger.info(
                 f"GEN | symbol={symbol} last={snap['last']:.6f} ma20={snap['ma20']:.6f} "
                 f"trend={snap['trend_strength']:.3f} vol={snap['volume_score']:.3f} "
-                f"conf={snap['confidence_score']:.3f} vol_reg={snap['volatility_regime']} "
+                f"conf={confidence:.3f} vol_reg={vol_reg} "
                 f"decision={final_decision}"
             )
+            logger.info(
+                f"ADAPTIVE_GATE | symbol={symbol} vol_reg={vol_reg} conf={confidence:.3f} "
+                f"base_min={base_min:.3f} adaptive_min={adaptive_min:.3f} pass={int(passes_adaptive)} "
+                f"enabled={int(ADAPTIVE_CONFIDENCE_ENABLED)}"
+            )
 
+            # Excel must say EXECUTE
             if final_decision != "EXECUTE":
+                continue
+
+            # Then adaptive confidence must pass
+            if not passes_adaptive:
+                try:
+                    log_event(
+                        "REJECT_ADAPTIVE_CONF",
+                        f"{symbol} conf={confidence:.4f} < {adaptive_min:.4f} vol_reg={vol_reg}",
+                    )
+                except Exception:
+                    pass
                 continue
 
             sig = _make_signal(symbol, snap, excel_out)
@@ -247,5 +293,4 @@ def generate_signal(symbols_override: Optional[List[str]] = None) -> Optional[Di
 
 
 def run_once(outbox_path: str = None, symbols_override: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
-    # outbox_path arg kept for backward compatibility
     return generate_signal(symbols_override=symbols_override)
