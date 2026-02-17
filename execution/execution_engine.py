@@ -95,7 +95,7 @@ class ExecutionEngine:
         if self.exchange is None:
             return
 
-        rows = list_active_oco_links(limit=50)
+        rows = list_active_oco_links(50)
         if not rows:
             return
 
@@ -222,7 +222,7 @@ class ExecutionEngine:
             return
 
         # 1) Cancel active OCO (if any)
-        rows = list_active_oco_links(limit=50)
+        rows = list_active_oco_links(50)
         rows = [r for r in rows if str(r[2] or "").upper() == str(symbol).upper()]
 
         def _norm(s: Any) -> str:
@@ -581,3 +581,4 @@ class ExecutionEngine:
             logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
             log_event("EXEC_LIVE_ERROR", f"{signal_id} err={e}")
             return
+
