@@ -439,10 +439,12 @@ class ExecutionEngine:
         from execution.exchange_client import LiveTradingBlocked
 
         try:
-            if quote_amount is None:                            
-                                last = self.exchange.fetch_last_price(symbol)
+            if quote_amount is None:
+                last = self.exchange.fetch_last_price(symbol)
                 quote_amount = float(position_size) * float(last)
+
             quote_amount = float(quote_amount)
+
 
             # ✅ NOTIONAL gate (exchange implementation handles specifics)
             min_notional = 0.0
@@ -614,6 +616,7 @@ class ExecutionEngine:
             logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
             log_event("EXEC_LIVE_ERROR", f"{signal_id} err={e}")
             return
+
 
 
 
