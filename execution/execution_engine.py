@@ -13,6 +13,10 @@ from execution.db.repository import (
     update_system_state,
     signal_id_already_executed,
     mark_signal_id_executed,
+    create_trade_open,
+    get_open_trade_by_signal,
+    close_trade,
+    get_latest_open_trade_for_symbol,
 )
 
 from execution.kill_switch import is_kill_switch_active
@@ -40,12 +44,14 @@ class ExecutionEngine:
         self.env_kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
         self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
 
+        # Public price feed for DEMO only
         self.price_feed = ccxt.binance({"enableRateLimit": True})
 
+        # Unified exchange client for LIVE/TESTNET (binance/bybit)
         self.exchange = None
         if self.mode in ("LIVE", "TESTNET"):
-            from execution.exchange_client import BinanceSpotClient
-            self.exchange = BinanceSpotClient()
+            from execution.exchange_client import UnifiedClient
+            self.exchange = UnifiedClient()
 
         self.state_debug = os.getenv("STATE_DEBUG", "false").lower() == "true"
 
@@ -108,7 +114,10 @@ class ExecutionEngine:
             ) = r
 
             if not tp_order_id or not sl_order_id:
-                logger.warning(f"OCO_RECONCILE_SKIP | link={link_id} missing order ids tp='{tp_order_id}' sl='{sl_order_id}'")
+                logger.warning(
+                    f"OCO_RECONCILE_SKIP | link={link_id} missing order ids "
+                    f"tp='{tp_order_id}' sl='{sl_order_id}'"
+                )
                 continue
 
             try:
@@ -125,12 +134,50 @@ class ExecutionEngine:
 
                 if sl_status in CLOSED:
                     set_oco_status(link_id, "CLOSED_SL")
-                    log_event("OCO_CLOSED", f"{signal_id} SL_FILLED sl={sl_order_id} tp={tp_order_id} tp_status={tp_status}")
+                    log_event(
+                        "OCO_CLOSED",
+                        f"{signal_id} SL_FILLED sl={sl_order_id} tp={tp_order_id} tp_status={tp_status}",
+                    )
+
+                    # close trade_history (best-effort)
+                    try:
+                        trow = get_open_trade_by_signal(str(signal_id))
+                        if trow:
+                            trade_id = int(trow[0])
+                            exit_price = float(sl.get("average") or sl.get("price") or 0.0) or None
+                            if exit_price:
+                                close_trade(
+                                    trade_id,
+                                    close_reason="SL",
+                                    exit_price=float(exit_price),
+                                    exit_order_id=str(sl_order_id),
+                                )
+                    except Exception as e:
+                        logger.warning(f"TRADE_HISTORY_CLOSE_WARN | reason=SL signal_id={signal_id} err={e}")
                     continue
 
                 if tp_status in CLOSED:
                     set_oco_status(link_id, "CLOSED_TP")
-                    log_event("OCO_CLOSED", f"{signal_id} TP_FILLED tp={tp_order_id} sl={sl_order_id} sl_status={sl_status}")
+                    log_event(
+                        "OCO_CLOSED",
+                        f"{signal_id} TP_FILLED tp={tp_order_id} sl={sl_order_id} sl_status={sl_status}",
+                    )
+
+                    # close trade_history (best-effort)
+                    try:
+                        trow = get_open_trade_by_signal(str(signal_id))
+                        if trow:
+                            trade_id = int(trow[0])
+                            exit_price = float(tp.get("average") or tp.get("price") or 0.0) or None
+                            if exit_price:
+                                close_trade(
+                                    trade_id,
+                                    close_reason="TP",
+                                    exit_price=float(exit_price),
+                                    exit_order_id=str(tp_order_id),
+                                )
+                    except Exception as e:
+                        logger.warning(f"TRADE_HISTORY_CLOSE_WARN | reason=TP signal_id={signal_id} err={e}")
                     continue
 
                 if (tp_status in CANCELED and sl_status == "open") or (sl_status in CANCELED and tp_status == "open"):
@@ -234,8 +281,25 @@ class ExecutionEngine:
         try:
             sell = self.exchange.place_market_sell(symbol=symbol, base_amount=sell_amount)
             avg = float(sell.get("average") or sell.get("price") or 0.0) or self.exchange.fetch_last_price(symbol)
-            logger.info(f"SELL_LIVE_OK | id={signal_id} symbol={symbol} amount={sell_amount} avg={avg} order_id={sell.get('id')}")
+            logger.info(
+                f"SELL_LIVE_OK | id={signal_id} symbol={symbol} amount={sell_amount} avg={avg} order_id={sell.get('id')}"
+            )
             log_event("SELL_LIVE_OK", f"{signal_id} {symbol} amount={sell_amount} avg={avg} order_id={sell.get('id')}")
+
+            # best-effort close trade_history for this symbol
+            try:
+                trow = get_latest_open_trade_for_symbol(str(symbol))
+                if trow:
+                    trade_id = int(trow[0])
+                    close_trade(
+                        trade_id,
+                        close_reason="SELL_SIGNAL",
+                        exit_price=float(avg),
+                        exit_order_id=str(sell.get("id") or ""),
+                    )
+            except Exception as e:
+                logger.warning(f"TRADE_HISTORY_CLOSE_WARN | reason=SELL_SIGNAL symbol={symbol} err={e}")
+
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="SELL_LIVE", symbol=str(symbol))
         except Exception as e:
             logger.exception(f"SELL_LIVE_ERROR | id={signal_id} symbol={symbol} err={e}")
@@ -250,7 +314,9 @@ class ExecutionEngine:
         signal_id = str(signal.get("signal_id", "UNKNOWN"))
         verdict = str(signal.get("final_verdict", "")).upper()
 
-        logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
+        logger.info(
+            f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}"
+        )
 
         # ✅ IDEMPOTENCY
         try:
@@ -274,7 +340,9 @@ class ExecutionEngine:
             return
 
         if not sync_ok or db_status not in ("ACTIVE", "RUNNING"):
-            logger.warning(f"EXEC_BLOCKED | system not ACTIVE/synced | id={signal_id} status={db_status} sync_ok={sync_ok}")
+            logger.warning(
+                f"EXEC_BLOCKED | system not ACTIVE/synced | id={signal_id} status={db_status} sync_ok={sync_ok}"
+            )
             log_event("EXEC_BLOCKED_SYSTEM_STATE", f"{signal_id} status={db_status} sync_ok={sync_ok}")
             return
 
@@ -343,7 +411,7 @@ class ExecutionEngine:
                 quote_amount = float(position_size) * float(last)
             quote_amount = float(quote_amount)
 
-            # ✅ Binance NOTIONAL gate
+            # ✅ NOTIONAL gate (exchange implementation handles specifics)
             min_notional = 0.0
             try:
                 min_notional = float(self.exchange.get_min_notional(symbol))
@@ -357,7 +425,12 @@ class ExecutionEngine:
                 )
                 logger.warning(msg)
                 log_event("EXEC_REJECT_MIN_NOTIONAL", msg)
-                mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_MIN_NOTIONAL", symbol=str(symbol))
+                mark_signal_id_executed(
+                    signal_id,
+                    signal_hash=signal_hash,
+                    action="REJECT_MIN_NOTIONAL",
+                    symbol=str(symbol),
+                )
                 return
 
             # ✅ last-millisecond kill switch
@@ -370,10 +443,29 @@ class ExecutionEngine:
             buy = self.exchange.place_market_buy_by_quote(symbol=symbol, quote_amount=quote_amount)
             buy_avg = float(buy.get("average") or buy.get("price") or 0.0) or self.exchange.fetch_last_price(symbol)
 
-            logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
-            log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
+            logger.info(
+                f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}"
+            )
+            log_event(
+                "TRADE_EXECUTED",
+                f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}",
+            )
 
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_LIVE_BUY", symbol=str(symbol))
+
+            # ✅ create trade_history row (for Auto-Scaler metrics)
+            try:
+                base_amount_est = float(quote_amount) / float(buy_avg) if float(buy_avg) > 0 else None
+                create_trade_open(
+                    signal_id=str(signal_id),
+                    symbol=str(symbol),
+                    quote_amount=float(quote_amount),
+                    entry_price=float(buy_avg),
+                    base_amount=base_amount_est,
+                    entry_order_id=str(buy.get("id") or ""),
+                )
+            except Exception as e:
+                logger.warning(f"TRADE_HISTORY_OPEN_WARN | id={signal_id} symbol={symbol} err={e}")
 
             base_asset = symbol.split("/")[0].upper()
             free_base = float(self.exchange.fetch_balance_free(base_asset))
@@ -479,11 +571,9 @@ class ExecutionEngine:
             log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
 
         except LiveTradingBlocked as e:
-            # ✅ This is a controlled safety block, not a crash.
             msg = f"EXEC_REJECT | LIVE_BLOCKED | id={signal_id} reason={e}"
             logger.warning(msg)
             log_event("EXEC_REJECT_LIVE_BLOCKED", msg)
-            # ✅ Mark to prevent endless retry spam
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_LIVE_BLOCKED", symbol=str(symbol))
             return
 
