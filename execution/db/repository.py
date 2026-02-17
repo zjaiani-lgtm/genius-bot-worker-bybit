@@ -20,7 +20,12 @@ def get_system_state():
     cur.execute("SELECT id, status, startup_sync_ok, kill_switch, updated_at_utc FROM system_state WHERE id=1")
     row = cur.fetchone()
     conn.close()
-    return row
+    if row is None:
+        return None
+    try:
+        return tuple(row)   # ✅ important: makes bootstrap + autoscaler health_ok work
+    except Exception:
+        return row
 
 
 def update_system_state(status: str = None, startup_sync_ok: int = None, kill_switch: int = None):
@@ -139,13 +144,31 @@ def set_oco_status(link_id: str, status: str):
     conn.close()
 
 
-def list_active_oco_links() -> List[Tuple]:
+def list_active_oco_links(limit: int = 50) -> List[Tuple]:
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id, link_id, symbol, tp_order_id, sl_order_id, status, created_at_utc FROM oco_links WHERE status='open'")
+    cur.execute(
+        """
+        SELECT id, link_id, symbol, tp_order_id, sl_order_id, status, created_at_utc
+        FROM oco_links
+        WHERE status='open'
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    )
     rows = cur.fetchall()
     conn.close()
-    return rows or []
+
+    # sqlite3.Row -> tuple conversion for consistent unpacking elsewhere
+    out = []
+    for r in rows or []:
+        try:
+            out.append(tuple(r))
+        except Exception:
+            out.append(r)
+    return out
+
 
 
 def has_active_oco_for_symbol(symbol: str) -> bool:
@@ -303,3 +326,4 @@ def list_recent_closed_trades(limit: int = 20) -> List[Tuple]:
     rows = cur.fetchall()
     conn.close()
     return rows or []
+
