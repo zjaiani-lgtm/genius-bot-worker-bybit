@@ -9,6 +9,8 @@ from execution.db.repository import get_system_state, update_system_state, log_e
 from execution.execution_engine import ExecutionEngine
 from execution.signal_client import pop_next_signal
 from execution.kill_switch import is_kill_switch_active
+from execution.auto_scaler import AutoScaler
+from execution.db.repository import mark_signal_id_executed
 
 logger = logging.getLogger("gbm")
 
@@ -75,6 +77,7 @@ def main():
     _bootstrap_state_if_needed()
 
     engine = ExecutionEngine()
+    auto_scaler = AutoScaler()
 
     try:
         engine.reconcile_oco()
@@ -108,7 +111,15 @@ def main():
             # 2) generate (optional)
             if generate_once is not None:
                 try:
-                    created = generate_once(outbox_path)
+                    diag_ok = None
+                    try:
+                        if engine.exchange is not None:
+                            diag_ok = bool((engine.exchange.diagnostics() or {}).get("ok"))
+                    except Exception:
+                        diag_ok = False
+
+                    active_symbols = auto_scaler.active_symbols(exchange_diag_ok=diag_ok)
+                    created = generate_once(outbox_path, symbols_override=active_symbols)
                     if created:
                         logger.info("SIGNAL_GENERATOR | signal created")
                 except Exception as e:
@@ -122,7 +133,27 @@ def main():
             sig = _safe_pop_next_signal(outbox_path)
             if sig:
                 logger.info(f"Signal received | id={sig.get('signal_id')} | verdict={sig.get('final_verdict')}")
-                engine.execute_signal(sig)
+                # ✅ basket enforcement (in case basket shrank between generate and execute)
+                try:
+                    diag_ok = None
+                    try:
+                        if engine.exchange is not None:
+                            diag_ok = bool((engine.exchange.diagnostics() or {}).get("ok"))
+                    except Exception:
+                        diag_ok = False
+
+                    active_symbols = set(auto_scaler.active_symbols(exchange_diag_ok=diag_ok))
+                    sym = str(((sig.get("execution") or {}).get("symbol")) or "").upper()
+                    if active_symbols and sym and sym not in active_symbols:
+                        logger.warning(f"EXEC_REJECT | symbol not in ACTIVE basket | symbol={sym}")
+                        log_event("EXEC_REJECT_NOT_IN_ACTIVE_BASKET", f"id={sig.get('signal_id')} symbol={sym}")
+                        # mark as executed so we don't loop on the same popped signal
+                        mark_signal_id_executed(str(sig.get("signal_id")), action="REJECT_ACTIVE_BASKET", symbol=sym)
+                    else:
+                        engine.execute_signal(sig)
+                except Exception as e:
+                    logger.warning(f"ACTIVE_BASKET_ENFORCE_WARN | err={e} -> fallback execute")
+                    engine.execute_signal(sig)
             else:
                 logger.info("Worker alive, waiting for SIGNAL_OUTBOX...")
 
