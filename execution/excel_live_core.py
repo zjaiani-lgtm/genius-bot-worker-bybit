@@ -2,269 +2,248 @@
 from __future__ import annotations
 
 import os
+import re
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple, Optional
 
-from openpyxl import load_workbook
+import openpyxl
 
 
-def _to_float(v: Any, default: float = 0.0) -> float:
-    if v is None:
-        return default
-    if isinstance(v, (int, float)):
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, x))
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
         return float(v)
-    if isinstance(v, str):
-        s = v.strip()
-        if s == "":
-            return default
-        # allow "+0.005"
-        try:
-            return float(s)
-        except Exception:
-            return default
-    return default
-
-
-def _to_bool(v: Any, default: bool = False) -> bool:
-    if v is None:
+    except Exception:
         return default
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return int(v) != 0
-    if isinstance(v, str):
-        s = v.strip().lower()
-        return s in ("1", "true", "yes", "y", "on")
-    return default
 
 
-def _safe_div(a: float, b: float, default: float = 0.0) -> float:
-    if b == 0:
-        return default
-    return a / b
+def _parse_threshold_cell(s: Any) -> Optional[float]:
+    """
+    Accepts values like '≥0.60', '>=0.64', '0.50', etc.
+    Returns float or None if not numeric.
+    """
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        return float(s)
+    txt = str(s).strip()
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", txt)
+    if not m:
+        return None
+    return float(m.group(1))
 
 
 @dataclass
-class LiveCoreConfig:
-    # base confidence buy threshold (from Excel CONFIG_CORE)
-    ai_conf_buy_min: float = 0.545
-
-    # adaptive confidence deltas by volatility regime
-    adaptive_conf_enabled: bool = True
-    adaptive_conf_high_vol_delta: float = 0.005
-    adaptive_conf_low_vol_delta: float = -0.005
-
-    # aggression scaler for size multiplier (from Excel CONFIG_CORE or safe defaults)
-    min_vol_for_aggression: float = 1.50
-    aggression_size_boost: float = 2.0
-
-    # optional: sell threshold if needed later
-    ai_conf_sell_min: float = 0.54
-
-
-@dataclass
-class LiveDecisionRow:
-    symbol: str
-    timeframe: str
-
-    # score/confidence from Excel decision engine
-    ai_score: float
-    final_trade_decision: str  # EXECUTE / STAND_BY (Excel-driven)
-
-    # patched Excel additions
-    adaptive_buy_gate: float
-    adaptive_size_mult: float
-
-    # extra context for transparency
-    volatility_ratio: float
-    volatility_regime: str  # LOW / NORMAL / HIGH
+class CoreInputs:
+    trend_strength: float          # 0..1
+    structure_ok: bool             # True/False
+    volume_score: float            # 0..1
+    risk_state: str                # OK / REDUCE / KILL
+    confidence_score: float        # 0..1
+    volatility_regime: str         # LOW / NORMAL / EXTREME
+    # volatility_ratio is used by AI_MASTER_LIVE_DECISION for size aggression (VOLATILITY_REGIME!C2)
+    # If you don't have a true ATR/MA ratio, feed a proxy (e.g., short ATR pct / long ATR pct).
+    volatility_ratio: float = 0.0
+    # optional macro flags (can be fed later)
+    liquidity_regime: str = "EXPANSION"        # EXPANSION / CONTRACTION
+    macro_risk_level: str = "LOW_RISK"         # LOW_RISK / HIGH_RISK
+    shock_absorber: str = "NORMAL"             # NORMAL / REDUCE_EXPOSURE
 
 
 class ExcelLiveCore:
     """
-    Reads a specific Excel workbook (path from EXCEL_MODEL_PATH) and returns a LiveDecisionRow.
+    Minimal "Live Core" evaluator based on your workbook:
+    - WEIGHT_THRESHOLD_MATRIX (weights + thresholds)
+    - LIVE_MACRO_RISK_GATE (ALLOW/BLOCK logic)
+    - AI_MASTER_LIVE_DECISION (EXECUTE/STAND_BY logic)
     """
 
-    def __init__(self, excel_path: Optional[str] = None):
-        self.excel_path = excel_path or os.getenv("EXCEL_MODEL_PATH", "").strip()
-        if not self.excel_path:
-            raise ValueError("EXCEL_MODEL_PATH is required")
+    def __init__(self, workbook_path: str):
+        if not os.path.exists(workbook_path):
+            raise FileNotFoundError(f"EXCEL_MODEL_NOT_FOUND: {workbook_path}")
 
-    # ---------------------------
-    # Workbook / Sheet helpers
-    # ---------------------------
+        # data_only=False because we DON'T rely on Excel formula calc.
+        # We compute outputs ourselves.
+        self.wb = openpyxl.load_workbook(workbook_path, data_only=False)
 
-    def _load(self):
-        # data_only=True reads cached formula values IF present; but we cannot rely on it.
-        # We still use it to read raw inputs; then compute the patched logic ourselves.
-        wb = load_workbook(self.excel_path, data_only=True, read_only=True)
-        return wb
+        self.weights, self.thresholds = self._load_weight_threshold_matrix()
+        self.config = self._load_config_core()
 
-    def _sheet(self, wb, name: str):
-        if name not in wb.sheetnames:
-            raise KeyError(f"Sheet not found: {name}. Available: {wb.sheetnames}")
-        return wb[name]
+    def _load_config_core(self) -> Dict[str, Any]:
+        """Loads CONFIG_CORE key/value pairs from the workbook.
 
-    def _get_cell(self, ws, cell: str) -> Any:
-        return ws[cell].value
-
-    # ---------------------------
-    # CONFIG_CORE mapping
-    # ---------------------------
-
-    def _read_config_core(self, wb) -> LiveCoreConfig:
+        This lets Python mirror lightweight Excel parameters without hardcoding.
         """
-        CONFIG_CORE expected cells:
-        - AI_CONFIDENCE_BUY_MIN:    B2
-        - AI_CONFIDENCE_SELL_MIN:   B3
-        - ADAPTIVE_CONFIDENCE_ENABLED: B4
-        - ADAPTIVE_CONF_HIGH_VOL_DELTA: B5
-        - ADAPTIVE_CONF_LOW_VOL_DELTA:  B6
-        - MIN_VOL_FOR_AGGRESSION:   B7
-        - AGGRESSION_SIZE_BOOST:    B8
+        cfg: Dict[str, Any] = {}
+        try:
+            ws = self.wb["CONFIG_CORE"]
+        except Exception:
+            return cfg
 
-        If your Excel uses different cells, change here ONCE.
-        """
-        ws = self._sheet(wb, "CONFIG_CORE")
-
-        cfg = LiveCoreConfig()
-        cfg.ai_conf_buy_min = _to_float(self._get_cell(ws, "B2"), cfg.ai_conf_buy_min)
-        cfg.ai_conf_sell_min = _to_float(self._get_cell(ws, "B3"), cfg.ai_conf_sell_min)
-
-        cfg.adaptive_conf_enabled = _to_bool(self._get_cell(ws, "B4"), cfg.adaptive_conf_enabled)
-        cfg.adaptive_conf_high_vol_delta = _to_float(self._get_cell(ws, "B5"), cfg.adaptive_conf_high_vol_delta)
-        cfg.adaptive_conf_low_vol_delta = _to_float(self._get_cell(ws, "B6"), cfg.adaptive_conf_low_vol_delta)
-
-        cfg.min_vol_for_aggression = _to_float(self._get_cell(ws, "B7"), cfg.min_vol_for_aggression)
-        cfg.aggression_size_boost = _to_float(self._get_cell(ws, "B8"), cfg.aggression_size_boost)
-
-        # safety clamps
-        cfg.ai_conf_buy_min = float(max(0.0, min(cfg.ai_conf_buy_min, 1.0)))
-        cfg.ai_conf_sell_min = float(max(0.0, min(cfg.ai_conf_sell_min, 1.0)))
-
-        cfg.adaptive_conf_high_vol_delta = float(max(-0.20, min(cfg.adaptive_conf_high_vol_delta, 0.20)))
-        cfg.adaptive_conf_low_vol_delta = float(max(-0.20, min(cfg.adaptive_conf_low_vol_delta, 0.20)))
-
-        cfg.min_vol_for_aggression = float(max(0.50, min(cfg.min_vol_for_aggression, 10.0)))
-        cfg.aggression_size_boost = float(max(1.0, min(cfg.aggression_size_boost, 10.0)))
-
+        # Expect: column A = key, column B = value
+        for r in range(1, ws.max_row + 1):
+            k = ws.cell(r, 1).value
+            v = ws.cell(r, 2).value
+            if not k:
+                continue
+            key = str(k).strip()
+            cfg[key] = v
         return cfg
 
-    # ---------------------------
-    # Volatility regime (Excel-like proxy)
-    # ---------------------------
+    def get_cfg_float(self, key: str, default: float) -> float:
+        return _safe_float(self.config.get(key), default)
 
-    def _compute_volatility_regime(self, short_vol: float, long_vol: float) -> Tuple[float, str]:
+    def _load_weight_threshold_matrix(self) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        ws = self.wb["WEIGHT_THRESHOLD_MATRIX"]
+
+        weights: Dict[str, float] = {}
+        thresholds: Dict[str, Any] = {}
+
+        # rows 2..7 are the matrix in your file
+        for r in range(2, ws.max_row + 1):
+            comp = ws.cell(r, 1).value
+            w = ws.cell(r, 2).value
+            th = ws.cell(r, 3).value
+
+            if not comp:
+                continue
+
+            comp_str = str(comp).strip().lower()
+            weights[comp_str] = _safe_float(w, 0.0)
+
+            # store raw threshold + parsed numeric if exists
+            thresholds[comp_str] = {
+                "raw": th,
+                "num": _parse_threshold_cell(th),
+            }
+
+        return weights, thresholds
+
+    def _macro_gate(self, inp: CoreInputs) -> str:
+        # Mirrors: IF(OR(A2="CONTRACTION",B2="HIGH_RISK",C2="REDUCE_EXPOSURE"),"BLOCK","ALLOW")
+        if inp.liquidity_regime == "CONTRACTION":
+            return "BLOCK"
+        if inp.macro_risk_level == "HIGH_RISK":
+            return "BLOCK"
+        if inp.shock_absorber == "REDUCE_EXPOSURE":
+            return "BLOCK"
+        return "ALLOW"
+
+    def _vol_allowed(self, regime: str) -> bool:
+        # "Allowed band only" → block EXTREME
+        return regime in ("LOW", "NORMAL")
+
+    def _score(self, inp: CoreInputs) -> float:
+        # Weighted sum based on matrix
+        w = self.weights
+
+        # Note: keys here match (lower-cased) Component names in the matrix.
+        trend_w = w.get("trend strength", 0.25)
+        vol_w = w.get("volatility regime", 0.10)
+        conf_w = w.get("confidence score", 0.15)
+        risk_w = w.get("risk state modifier", 0.15)
+        volconf_w = w.get("volume confirmation", 0.15)
+        struct_w = w.get("structure validation", 0.20)
+
+        # map risk_state to numeric (OK=1, REDUCE=0.5, KILL=0)
+        risk_num = 1.0 if inp.risk_state == "OK" else (0.5 if inp.risk_state == "REDUCE" else 0.0)
+
+        # map volatility to numeric (LOW=0.8, NORMAL=1.0, EXTREME=0.0)
+        vol_num = 1.0 if inp.volatility_regime == "NORMAL" else (0.8 if inp.volatility_regime == "LOW" else 0.0)
+
+        struct_num = 1.0 if inp.structure_ok else 0.0
+
+        total = (
+            inp.trend_strength * trend_w +
+            struct_num * struct_w +
+            inp.volume_score * volconf_w +
+            risk_num * risk_w +
+            inp.confidence_score * conf_w +
+            vol_num * vol_w
+        )
+
+        # normalize to 0..1 (weights sum already ~1, but clamp anyway)
+        return _clamp(total, 0.0, 1.0)
+
+    def decide(self, inp: CoreInputs) -> Dict[str, Any]:
         """
-        Compute volatility_ratio and classify:
-        - HIGH if ratio >= 1.50
-        - LOW if ratio <= 0.70
-        - else NORMAL
-        """
-        ratio = _safe_div(short_vol, long_vol, default=1.0)
-        # clamp to reasonable numeric space
-        if not math.isfinite(ratio):
-            ratio = 1.0
-
-        regime = "NORMAL"
-        if ratio >= 1.50:
-            regime = "HIGH"
-        elif ratio <= 0.70:
-            regime = "LOW"
-        return ratio, regime
-
-    # ---------------------------
-    # Patched Excel logic
-    # ---------------------------
-
-    def _adaptive_buy_gate(self, cfg: LiveCoreConfig, vol_regime: str) -> float:
-        """
-        E column in patched Excel:
-        Adaptive Buy Gate = base_buy_min + delta_by_regime (if enabled)
-        """
-        gate = cfg.ai_conf_buy_min
-        if cfg.adaptive_conf_enabled:
-            if vol_regime == "HIGH":
-                gate += cfg.adaptive_conf_high_vol_delta
-            elif vol_regime == "LOW":
-                gate += cfg.adaptive_conf_low_vol_delta
-        # clamp
-        gate = float(max(0.0, min(gate, 1.0)))
-        return gate
-
-    def _adaptive_size_mult(self, cfg: LiveCoreConfig, volatility_ratio: float) -> float:
-        """
-        F column in patched Excel:
-        Adaptive Size Mult = IF(volatility_ratio >= MIN_VOL_FOR_AGGRESSION, AGGRESSION_SIZE_BOOST, 1)
-        """
-        mult = 1.0
-        if volatility_ratio >= cfg.min_vol_for_aggression:
-            mult = cfg.aggression_size_boost
-        # clamp
-        mult = float(max(1.0, min(mult, 10.0)))
-        return mult
-
-    # ---------------------------
-    # AI_MASTER_LIVE_DECISION mapping
-    # ---------------------------
-
-    def _read_live_decision_inputs(self, wb) -> Dict[str, Any]:
-        """
-        AI_MASTER_LIVE_DECISION expected inputs:
-        - Symbol:            B2
-        - Timeframe:         C2
-        - AIScore:           D2
-        - ShortVol:          H2
-        - LongVol:           I2
-
-        (We do NOT rely on E2/F2 computed in Excel because formulas may not be cached.)
-
-        If your sheet uses different cells, adjust here.
-        """
-        ws = self._sheet(wb, "AI_MASTER_LIVE_DECISION")
-        data = {
-            "symbol": self._get_cell(ws, "B2"),
-            "timeframe": self._get_cell(ws, "C2"),
-            "ai_score": self._get_cell(ws, "D2"),
-            "short_vol": self._get_cell(ws, "H2"),
-            "long_vol": self._get_cell(ws, "I2"),
+        Returns:
+        {
+          "ai_score": float(0..1),
+          "macro_gate": "ALLOW"|"BLOCK",
+          "active_strategy": "YES"|"NO",
+          "final_trade_decision": "EXECUTE"|"STAND_BY",
+          "reasons": {...}
         }
-        return data
+        """
 
-    # ---------------------------
-    # Public API
-    # ---------------------------
+        ai_score = self._score(inp)
+        macro_gate = self._macro_gate(inp)
 
-    def read_live_decision(self) -> LiveDecisionRow:
-        wb = self._load()
-        try:
-            cfg = self._read_config_core(wb)
-            inputs = self._read_live_decision_inputs(wb)
+        # Thresholds from matrix (if present)
+        trend_th = (self.thresholds.get("trend strength", {}) or {}).get("num", 0.60) or 0.60
+        vol_th = (self.thresholds.get("volume confirmation", {}) or {}).get("num", 0.50) or 0.50
+        conf_th = (self.thresholds.get("confidence score", {}) or {}).get("num", 0.64) or 0.64
 
-            symbol = str(inputs.get("symbol") or "").strip()
-            tf = str(inputs.get("timeframe") or "").strip()
+        # --- Adaptive gates from AI_MASTER_LIVE_DECISION (mirrors Excel formulas) ---
+        # E2 = AI_CONFIDENCE_BUY_MIN + delta(low/high)
+        base_buy_min = self.get_cfg_float("AI_CONFIDENCE_BUY_MIN", 0.54)
+        low_delta = self.get_cfg_float("ADAPTIVE_CONF_LOW_VOL_DELTA", -0.005)
+        high_delta = self.get_cfg_float("ADAPTIVE_CONF_HIGH_VOL_DELTA", 0.005)
 
-            ai_score = _to_float(inputs.get("ai_score"), 0.0)
-            short_vol = _to_float(inputs.get("short_vol"), 0.0)
-            long_vol = _to_float(inputs.get("long_vol"), 0.0)
+        vr = str(inp.volatility_regime or "NORMAL").upper()
+        if vr == "LOW":
+            adaptive_buy_gate = float(base_buy_min) + float(low_delta)
+        elif vr == "HIGH":
+            adaptive_buy_gate = float(base_buy_min) + float(high_delta)
+        else:
+            adaptive_buy_gate = float(base_buy_min)
 
-            volatility_ratio, vol_regime = self._compute_volatility_regime(short_vol, long_vol)
-            adaptive_gate = self._adaptive_buy_gate(cfg, vol_regime)
-            size_mult = self._adaptive_size_mult(cfg, volatility_ratio)
+        # F2 = IF(vol_ratio >= MIN_VOL_FOR_AGGRESSION, AGGRESSION_SIZE_BOOST, 1)
+        min_vol_for_aggr = self.get_cfg_float("MIN_VOL_FOR_AGGRESSION", 0.10)
+        aggr_boost = self.get_cfg_float("AGGRESSION_SIZE_BOOST", 1.15)
+        adaptive_size_mult = float(aggr_boost) if float(inp.volatility_ratio) >= float(min_vol_for_aggr) else 1.0
 
-            # Final Decision (patched Excel): EXECUTE if ai_score >= adaptive_gate else STAND_BY
-            final_decision = "EXECUTE" if ai_score >= adaptive_gate else "STAND_BY"
+        # Gates
+        trend_ok = inp.trend_strength >= float(trend_th)
+        vol_ok = inp.volume_score >= float(vol_th)
+        conf_ok = inp.confidence_score >= float(conf_th)
+        struct_ok = bool(inp.structure_ok)
+        risk_ok = inp.risk_state != "KILL"
+        volband_ok = self._vol_allowed(inp.volatility_regime)
 
-            return LiveDecisionRow(
-                symbol=symbol,
-                timeframe=tf,
-                ai_score=ai_score,
-                final_trade_decision=final_decision,
-                adaptive_buy_gate=adaptive_gate,
-                adaptive_size_mult=size_mult,
-                volatility_ratio=volatility_ratio,
-                volatility_regime=vol_regime,
-            )
-        finally:
-            wb.close()
+        # "Active Strategy" (minimal mapping): YES if core gates mostly OK
+        active_strategy = "YES" if (trend_ok and struct_ok and vol_ok and conf_ok and risk_ok and volband_ok) else "NO"
+
+        # Mirrors patched Excel:
+        # Final = IF(AND(MacroGate="ALLOW",ActiveStrategy="YES",AIScore>=AdaptiveBuyGate),"EXECUTE","STAND_BY")
+        final_trade_decision = "EXECUTE" if (macro_gate == "ALLOW" and active_strategy == "YES" and ai_score >= float(adaptive_buy_gate)) else "STAND_BY"
+
+        return {
+            "ai_score": ai_score,
+            "macro_gate": macro_gate,
+            "active_strategy": active_strategy,
+            "final_trade_decision": final_trade_decision,
+            "adaptive_buy_gate": float(adaptive_buy_gate),
+            "adaptive_size_mult": float(adaptive_size_mult),
+            "reasons": {
+                "trend_strength": inp.trend_strength,
+                "trend_ok": trend_ok,
+                "structure_ok": struct_ok,
+                "volume_score": inp.volume_score,
+                "volume_ok": vol_ok,
+                "confidence_score": inp.confidence_score,
+                "confidence_ok": conf_ok,
+                "risk_state": inp.risk_state,
+                "risk_ok": risk_ok,
+                "volatility_regime": inp.volatility_regime,
+                "volatility_ratio": float(inp.volatility_ratio),
+                "volband_ok": volband_ok,
+            }
+        }
