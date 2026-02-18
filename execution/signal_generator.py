@@ -163,7 +163,11 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
         volume_score = _clamp(vlast / v20, 0.0, 1.5) / 1.5
 
     # ✅ Excel-driven confidence (hedge-grade)
-    confidence_score = _read_excel_confidence()
+    raw_conf = _read_excel_confidence()
+
+# ===== INSTITUTIONAL MICRO BOOST =====
+confidence_score = _clamp(raw_conf * 1.08, 0.0, 1.0)
+
 
     # volatility proxy
     abs_rets = []
@@ -197,3 +201,4 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
         "last": last,
         "ma20": ma20,
     }
+
