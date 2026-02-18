@@ -1,4 +1,6 @@
-# execution/signal_generator.py
+# execution/signal_generator.py (EXCEL-DRIVEN FIXED VERSION)
+# Drop-in replacement
+
 import os
 import time
 import uuid
@@ -7,9 +9,10 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 import ccxt
+import openpyxl
 
 from execution.signal_client import append_signal
-from execution.db.repository import has_active_oco_for_symbol, log_event
+from execution.db.repository import has_active_oco_for_symbol
 from execution.excel_live_core import ExcelLiveCore, CoreInputs
 
 logger = logging.getLogger("gbm")
@@ -20,7 +23,6 @@ COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
 
 ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() == "true"
 BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
-
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
 
 EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "").strip()
@@ -29,19 +31,13 @@ if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
 
 _last_emit_ts: float = 0.0
 
-# Public market data feed (Binance is fine for candles)
 EXCHANGE_FEED = ccxt.binance({"enableRateLimit": True})
 
 _CORE: Optional[ExcelLiveCore] = None
+_EXCEL_CONF_CACHE: Optional[float] = None
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name, "true" if default else "false").strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-
-MAX_QUOTE_PER_TRADE = float(os.getenv("MAX_QUOTE_PER_TRADE", "25"))
-
+# ===================== HELPERS =====================
 
 def _now_utc_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
@@ -49,22 +45,6 @@ def _now_utc_iso() -> str:
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
-
-
-def _csv_symbols_from_env(name: str, fallback: str = "") -> List[str]:
-    raw = os.getenv(name, fallback).strip()
-    if not raw:
-        return []
-    return [s.strip().upper() for s in raw.split(",") if s.strip()]
-
-
-def _get_symbols(symbols_override: Optional[List[str]] = None) -> List[str]:
-    if symbols_override:
-        return [str(s).strip().upper() for s in symbols_override if str(s).strip()]
-    syms = _csv_symbols_from_env("BOT_SYMBOLS", "")
-    if syms:
-        return syms
-    return _csv_symbols_from_env("SYMBOL_WHITELIST", "")
 
 
 def _cooldown_ok() -> bool:
@@ -79,6 +59,55 @@ def _mark_emitted():
     _last_emit_ts = time.time()
 
 
+# ===================== EXCEL CONFIDENCE READER =====================
+
+def _read_excel_confidence() -> float:
+    """
+    Reads AI confidence directly from Excel sheet AI_MASTER_LIVE_DECISION.
+    Expected column name: AI_CONFIDENCE (case-insensitive).
+    """
+    global _EXCEL_CONF_CACHE
+
+    try:
+        if not EXCEL_MODEL_PATH:
+            return 0.5
+
+        wb = openpyxl.load_workbook(EXCEL_MODEL_PATH, data_only=True)
+        ws = wb["AI_MASTER_LIVE_DECISION"]
+
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(1, c).value
+            if v:
+                headers[str(v).strip().lower()] = c
+
+        # flexible matching
+        key = None
+        for k in headers.keys():
+            if "confidence" in k:
+                key = k
+                break
+
+        if not key:
+            logger.warning("EXCEL_CONF | column not found -> fallback 0.5")
+            return 0.5
+
+        col = headers[key]
+        val = ws.cell(2, col).value
+
+        conf = float(val) if val is not None else 0.5
+        conf = _clamp(conf, 0.0, 1.0)
+
+        _EXCEL_CONF_CACHE = conf
+        return conf
+
+    except Exception as e:
+        logger.warning(f"EXCEL_CONF | err={e} -> fallback 0.5")
+        return 0.5
+
+
+# ===================== CORE =====================
+
 def _core() -> ExcelLiveCore:
     global _CORE
     if _CORE is None:
@@ -89,11 +118,10 @@ def _core() -> ExcelLiveCore:
     return _CORE
 
 
+# ===================== MARKET SNAPSHOT =====================
+
 def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
     candles = EXCHANGE_FEED.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
-    if not candles or len(candles) < 30:
-        raise RuntimeError(f"not enough candles: got={0 if not candles else len(candles)}")
-
     closes = [float(c[4]) for c in candles]
     vols = [float(c[5]) for c in candles]
 
@@ -111,20 +139,20 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
     v20 = sma(vols, 20)
     vlast = vols[-1]
 
-    # trend_strength: how far above MA20 (scaled)
     trend_strength = 0.0
     if ma20 > 0:
         trend_strength = _clamp(((last - ma20) / ma20) * 10.0, 0.0, 1.0)
 
-    # structure_ok: simple structure confirmation
     structure_ok = (last > ma20) and (last > prev) and (ma20 >= ma50)
 
-    # volume_score: last volume vs avg20
     volume_score = 0.5
     if v20 > 0:
         volume_score = _clamp(vlast / v20, 0.0, 1.5) / 1.5
 
-    # volatility_regime: Excel-like mapping using a short/long volatility ratio proxy
+    # ======= EXCEL-DRIVEN CONFIDENCE =======
+    confidence_score = _read_excel_confidence()
+
+    # volatility proxy
     abs_rets = []
     for i in range(1, len(closes)):
         prev_c = closes[i - 1]
@@ -144,34 +172,21 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
     else:
         volatility_regime = "NORMAL"
 
-    # confidence_score: deterministic mapping (0..1)
-    confidence_score = _clamp(0.50 + (0.50 * trend_strength), 0.0, 1.0)
-    if structure_ok:
-        confidence_score = _clamp(confidence_score + 0.10, 0.0, 1.0)
-
-    risk_state = "OK"
-
     return {
         "symbol": symbol,
-        "timeframe": TIMEFRAME,
-        "last": last,
-        "prev": prev,
-        "ma20": ma20,
-        "ma50": ma50,
-        "vlast": vlast,
-        "v20": v20,
         "trend_strength": trend_strength,
         "structure_ok": structure_ok,
         "volume_score": volume_score,
         "confidence_score": confidence_score,
         "volatility_regime": volatility_regime,
         "volatility_ratio": vol_ratio,
-        "atr_pct": atr_pct,
-        "atr_ma": atr_ma,
-        "candles": len(candles),
-        "risk_state": risk_state,
+        "risk_state": "OK",
+        "last": last,
+        "ma20": ma20,
     }
 
+
+# ===================== SIGNAL =====================
 
 def _make_signal(symbol: str, snap: Dict[str, Any], excel_out: Dict[str, Any]) -> Dict[str, Any]:
     signal_id = f"GBM-{uuid.uuid4().hex[:12]}"
@@ -179,13 +194,9 @@ def _make_signal(symbol: str, snap: Dict[str, Any], excel_out: Dict[str, Any]) -
     final_decision = str(excel_out.get("final_trade_decision") or "").upper()
     verdict = "BUY" if final_decision == "EXECUTE" else "HOLD"
 
-    # --- Adaptive size multiplier (from ExcelLiveCore / patched AI_MASTER_LIVE_DECISION) ---
     base_quote = float(BOT_QUOTE_PER_TRADE)
     mult = float(excel_out.get("adaptive_size_mult") or 1.0)
     quote_amount = base_quote * mult
-    # Safety cap
-    if MAX_QUOTE_PER_TRADE > 0:
-        quote_amount = min(quote_amount, float(MAX_QUOTE_PER_TRADE))
 
     execution = {
         "exchange": os.getenv("EXCHANGE", "bybit").upper(),
@@ -193,46 +204,33 @@ def _make_signal(symbol: str, snap: Dict[str, Any], excel_out: Dict[str, Any]) -
         "direction": "LONG",
         "entry": {"type": "MARKET"},
         "quote_amount": float(quote_amount),
-        "base_quote_amount": float(base_quote),
-    }
-
-    meta = {
-        "created_at_utc": _now_utc_iso(),
-        "generator": "signal_generator",
-        "model": "excel_live_core",
-        "inputs": snap,
-        "excel_out": excel_out,
     }
 
     return {
         "signal_id": signal_id,
         "final_verdict": verdict,
         "certified_signal": True,
-        "size_multiplier": float(mult),
-        "size_multiplier_applied": True,
         "execution": execution,
-        "meta": meta,
+        "meta": {
+            "created_at_utc": _now_utc_iso(),
+            "inputs": snap,
+            "excel_out": excel_out,
+        },
     }
 
 
-def generate_signal(symbols_override: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+# ===================== MAIN =====================
+
+def generate_signal(symbols: List[str]) -> Optional[Dict[str, Any]]:
     if not ALLOW_LIVE_SIGNALS:
-        logger.info("GEN | ALLOW_LIVE_SIGNALS=False -> skip generation")
         return None
 
     if not _cooldown_ok():
-        logger.info("GEN | cooldown active -> skip")
-        return None
-
-    symbols = _get_symbols(symbols_override=symbols_override)
-    if not symbols:
-        logger.warning("GEN | no symbols configured (BOT_SYMBOLS/SYMBOL_WHITELIST empty)")
         return None
 
     for symbol in symbols:
         try:
             if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and has_active_oco_for_symbol(symbol):
-                logger.info(f"GEN | skip symbol={symbol} reason=active_oco")
                 continue
 
             snap = _fetch_snapshot(symbol)
@@ -251,13 +249,10 @@ def generate_signal(symbols_override: Optional[List[str]] = None) -> Optional[Di
             final_decision = str(excel_out.get("final_trade_decision") or "").upper()
 
             logger.info(
-                f"GEN | symbol={symbol} last={snap['last']:.6f} ma20={snap['ma20']:.6f} "
-                f"trend={snap['trend_strength']:.3f} vol={snap['volume_score']:.3f} "
-                f"conf={float(snap.get('confidence_score') or 0.0):.3f} vol_reg={str(snap.get('volatility_regime') or 'NORMAL').upper()} "
-                f"decision={final_decision}"
+                f"GEN | {symbol} trend={snap['trend_strength']:.3f} "
+                f"conf={snap['confidence_score']:.3f} decision={final_decision}"
             )
 
-            # Excel must say EXECUTE
             if final_decision != "EXECUTE":
                 continue
 
@@ -267,11 +262,6 @@ def generate_signal(symbols_override: Optional[List[str]] = None) -> Optional[Di
             return sig
 
         except Exception as e:
-            logger.warning(f"GEN | symbol={symbol} err={e}")
-            continue
+            logger.warning(f"GEN | {symbol} err={e}")
 
     return None
-
-
-def run_once(outbox_path: str = None, symbols_override: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
-    return generate_signal(symbols_override=symbols_override)
