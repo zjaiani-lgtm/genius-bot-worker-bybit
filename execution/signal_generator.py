@@ -93,21 +93,37 @@ def _read_excel_confidence() -> float:
 
         ws = _EXCEL_WB["AI_MASTER_LIVE_DECISION"]
 
-        # ===== FIND CONF COLUMN =====
-        key = None
-        for k in _EXCEL_HEADERS.keys():
-            if "confidence" in k:
-                key = k
-                break
+        # ===== HEDGE AUTO-DETECT CONF COLUMN =====
+key = None
 
-        if not key:
-            logger.warning("EXCEL_CONF | column not found -> fallback 0.5")
-            return 0.5
+CONF_ALIASES = [
+    "confidence",
+    "ai confidence",
+    "ai score",
+    "score",
+]
+
+for k in _EXCEL_HEADERS.keys():
+    kl = str(k).lower()
+    if any(alias in kl for alias in CONF_ALIASES):
+        key = k
+        break
+
+if not key:
+    logger.warning(
+        f"EXCEL_CONF | column not found among={list(_EXCEL_HEADERS.keys())} -> fallback 0.5"
+    )
+    return 0.5
+
 
         col = _EXCEL_HEADERS[key]
-        val = ws.cell(2, col).value
 
-        conf = float(val) if val is not None else 0.5
+# ===== SAFE ROW RESOLVE =====
+row_idx = 2
+val = ws.cell(row_idx, col).value
+
+conf = float(val) if val is not None else 0.5
+
         conf = _clamp(conf, 0.0, 1.0)
 
         _EXCEL_CONF_CACHE = conf
@@ -201,4 +217,5 @@ confidence_score = _clamp(raw_conf * 1.08, 0.0, 1.0)
         "last": last,
         "ma20": ma20,
     }
+
 
