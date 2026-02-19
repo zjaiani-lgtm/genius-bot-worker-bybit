@@ -30,6 +30,7 @@ BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").strip().lower() == "true"
 GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == "true"
 GEN_TEST_SIGNAL = os.getenv("GEN_TEST_SIGNAL", "false").strip().lower() == "true"
+TEST_QUOTE_AMOUNT = float(os.getenv("TEST_QUOTE_AMOUNT", "5") or "5")
 
 # Guards / Edge
 MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.60"))
@@ -55,18 +56,15 @@ def _now_utc_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def _get_outbox_path() -> str:
+def _get_outbox_path(outbox_path: Optional[str]) -> str:
+    if outbox_path:
+        return str(outbox_path).strip()
     return (os.getenv("OUTBOX_PATH") or os.getenv("SIGNAL_OUTBOX_PATH") or DEFAULT_OUTBOX).strip()
 
 
-def _parse_symbols() -> List[str]:
+def _parse_symbols_from_env() -> List[str]:
     raw = (os.getenv("BOT_SYMBOLS") or os.getenv("SYMBOL_WHITELIST") or "BTC/USDT:USDT").strip()
-    syms = []
-    for s in raw.split(","):
-        s = s.strip()
-        if s:
-            syms.append(s)
-    return syms
+    return [s.strip() for s in raw.split(",") if s.strip()]
 
 
 def _cooldown_ok() -> bool:
@@ -86,7 +84,7 @@ def _has_active_oco(symbol: str) -> bool:
     try:
         return bool(has_active_oco_for_symbol(symbol))
     except Exception as e:
-        # safer: assume OCO active to avoid uncontrolled trades
+        # safer: assume active to avoid uncontrolled trades
         logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | symbol={symbol} err={e} -> assume active_oco=True")
         return True
 
@@ -103,7 +101,6 @@ def _resolve_excel_path() -> str:
         if p and os.path.exists(p):
             return p
         if p:
-            # config returned but doesn't exist -> continue to fallback
             logger.warning(f"[GEN] EXCEL_PATH_MISSING_FROM_CONFIG | path={p}")
     except Exception:
         pass
@@ -122,7 +119,7 @@ def _resolve_excel_path() -> str:
         if p and os.path.exists(p):
             return p
 
-    # debug info
+    # debug dirs
     try:
         assets_list = os.listdir("/opt/render/project/src/assets")
     except Exception:
@@ -149,7 +146,6 @@ def _core() -> ExcelLiveCore:
 def _exchange() -> ccxt.Exchange:
     cls = getattr(ccxt, EXCHANGE_ID)
 
-    # Keys are optional for OHLCV, but keep them if set (for some endpoints)
     api_key = os.getenv("BYBIT_API_KEY" if EXCHANGE_ID == "bybit" else "BINANCE_API_KEY", "").strip()
     api_secret = os.getenv("BYBIT_API_SECRET" if EXCHANGE_ID == "bybit" else "BINANCE_API_SECRET", "").strip()
 
@@ -160,12 +156,9 @@ def _exchange() -> ccxt.Exchange:
         "options": {},
     })
 
-    # Bybit market type tuning for symbols like BTC/USDT:USDT
     if EXCHANGE_ID == "bybit":
         ex.options["defaultType"] = BYBIT_DEFAULT_TYPE
-        # these help with linear USDT perp in some ccxt versions
         ex.options["defaultSubType"] = "linear"
-
         if MODE == "TESTNET":
             try:
                 ex.set_sandbox_mode(True)
@@ -259,29 +252,53 @@ def _build_trade_signal(symbol: str, direction: str, quote_amount: float) -> Dic
         "direction": direction,
         "execution": {
             "symbol": symbol,
+            "direction": direction,
             "side": "BUY" if direction.upper() == "LONG" else "SELL",
             "quote_amount": float(quote_amount),
         },
     }
 
 
-def generate_signal() -> Optional[Dict[str, Any]]:
+def generate_signal(
+    outbox_path: Optional[str] = None,
+    symbols_override: Optional[List[str]] = None
+) -> bool:
     """
-    Legacy API (some main.py expects this).
-    Creates at most 1 signal per call.
+    ✅ This signature matches main.py usage:
+        created = generate_once(outbox_path, symbols_override=active_symbols)
+
+    Returns True if a signal was emitted, else False.
     """
-    outbox_path = _get_outbox_path()
+    outbox = _get_outbox_path(outbox_path)
 
     if not _cooldown_ok():
-        return None
+        return False
 
-    symbols = _parse_symbols()
+    # Decide symbols list
+    symbols = symbols_override if (symbols_override and len(symbols_override) > 0) else _parse_symbols_from_env()
+
+    # Optional test signal
+    if GEN_TEST_SIGNAL:
+        sym = symbols[0] if symbols else "BTC/USDT:USDT"
+        sid = f"TEST-{uuid.uuid4()}"
+        test_sig = {
+            "signal_id": sid,
+            "ts_utc": _now_utc_iso(),
+            "source": "TEST",
+            "final_verdict": "TRADE",
+            "direction": "LONG",
+            "execution": {"symbol": sym, "direction": "LONG", "side": "BUY", "quote_amount": float(TEST_QUOTE_AMOUNT)},
+        }
+        _emit(test_sig, outbox)
+        logger.info(f"[GEN] TEST_SIGNAL_EMITTED | id={sid} symbol={sym} outbox={outbox}")
+        return True
+
+    # Live core
     core = _core()
 
     for symbol in symbols:
         active_oco = _has_active_oco(symbol)
 
-        # Optional risk-first gate
         if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and active_oco:
             if GEN_LOG_EVERY_TICK:
                 logger.info(f"[GEN] BLOCK_ACTIVE_OCO | symbol={symbol}")
@@ -319,35 +336,37 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 ma20=ma20,
                 atr_pct=atrp,
             )
-            core_out = core.decide(inputs)
-            # expected keys: ai_confidence, macro_policy, strategy_flag, final_trade_decision, risk_state
-            ai = float(getattr(core_out, "ai_confidence", 0.0) or 0.0)
-            macro = str(getattr(core_out, "macro_policy", "ALLOW") or "ALLOW")
-            strat = str(getattr(core_out, "strategy_flag", "NO") or "NO")
-            final = str(getattr(core_out, "final_trade_decision", "STAND_BY") or "STAND_BY")
-            risk = str(getattr(core_out, "risk_state", "OK") or "OK")
+            out = core.decide(inputs)
+
+            ai = float(getattr(out, "ai_confidence", 0.0) or 0.0)
+            macro = str(getattr(out, "macro_policy", "ALLOW") or "ALLOW")
+            strat = str(getattr(out, "strategy_flag", "NO") or "NO")
+            final = str(getattr(out, "final_trade_decision", "STAND_BY") or "STAND_BY")
+            risk = str(getattr(out, "risk_state", "OK") or "OK")
         except Exception as e:
             logger.warning(f"[GEN] CORE_FAIL | symbol={symbol} err={e}")
             continue
 
+        if GEN_LOG_EVERY_TICK:
+            logger.info(
+                f"[GEN] CORE_DECISION | symbol={symbol} ai={ai:.3f} macro={macro} strat={strat} final={final} "
+                f"risk={risk} volReg={vol_reg} atr%={atrp:.2f} last={last:.4f} ma20={ma20:.4f} outbox={outbox}"
+            )
+
         # Macro + risk gate
         if str(macro).upper() not in ("ALLOW", "ON", "TRUE"):
-            if GEN_LOG_EVERY_TICK:
-                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason=MACRO_BLOCK macro={macro}")
             continue
         if str(risk).upper() not in ("OK", "SAFE", "GREEN"):
-            if GEN_LOG_EVERY_TICK:
-                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason=RISK_BLOCK risk={risk}")
             continue
 
         # Edge gates
         if not edge_ok:
             if GEN_LOG_EVERY_TICK:
-                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason={edge_reason} atr%={atrp:.2f} volReg={vol_reg}")
+                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason={edge_reason}")
             continue
         if not mag_ok:
             if GEN_LOG_EVERY_TICK:
-                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason={mag_reason} last={last:.4f} ma20={ma20:.4f}")
+                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason={mag_reason}")
             continue
 
         # Confidence gate
@@ -358,12 +377,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         # Final decision gate
         if str(final).upper() != "EXECUTE":
-            if GEN_LOG_EVERY_TICK:
-                logger.info(
-                    f"[GEN] CORE_DECISION | symbol={symbol} ai={ai:.3f} macro={macro} strat={strat} "
-                    f"final={final} risk={risk} volReg={vol_reg} atr%={atrp:.2f} last={last:.4f} ma20={ma20:.4f} "
-                    f"outbox={outbox_path}"
-                )
             continue
 
         # Live generation gate
@@ -372,45 +385,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             continue
 
         sig = _build_trade_signal(symbol=symbol, direction="LONG", quote_amount=BOT_QUOTE_PER_TRADE)
-        _emit(sig, outbox_path)
-        logger.info(f"[GEN] SIGNAL_EMITTED | id={sig['signal_id']} symbol={symbol} quote={BOT_QUOTE_PER_TRADE} outbox={outbox_path}")
-        return sig
-
-    return None
-
-
-def run_once(outbox_path: str, symbols_override: Optional[List[str]] = None) -> bool:
-    """
-    New API (your newer main.py uses this).
-    Returns True if a signal was created.
-    """
-    # override outbox if passed
-    if outbox_path:
-        os.environ["SIGNAL_OUTBOX_PATH"] = str(outbox_path)
-
-    if symbols_override:
-        # turn list into BOT_SYMBOLS for this tick only
-        os.environ["BOT_SYMBOLS"] = ",".join([str(s).strip() for s in symbols_override if str(s).strip()])
-
-    # test signal (optional)
-    if GEN_TEST_SIGNAL:
-        sid = f"TEST-{uuid.uuid4()}"
-        sym = (symbols_override[0] if symbols_override else (_parse_symbols()[0] if _parse_symbols() else "BTC/USDT:USDT"))
-        test_sig = {
-            "signal_id": sid,
-            "ts_utc": _now_utc_iso(),
-            "source": "TEST",
-            "final_verdict": "TRADE",
-            "direction": "LONG",
-            "execution": {"symbol": sym, "side": "BUY", "quote_amount": float(os.getenv("TEST_QUOTE_AMOUNT", "5") or "5")},
-        }
-        _emit(test_sig, _get_outbox_path())
-        logger.info(f"[GEN] TEST_SIGNAL_EMITTED | id={sid} symbol={sym} outbox={_get_outbox_path()}")
+        _emit(sig, outbox)
+        logger.info(f"[GEN] SIGNAL_EMITTED | id={sig['signal_id']} symbol={symbol} quote={BOT_QUOTE_PER_TRADE} outbox={outbox}")
         return True
 
-    sig = generate_signal()
-    return bool(sig)
-
-
-# Backward-compat alias (some older code imports generate_once)
-generate_once = run_once
+    return False
