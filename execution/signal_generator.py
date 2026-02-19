@@ -203,14 +203,35 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
     Also requires ATR% to be high enough to realistically reach TP on this TF.
     """
     # Feasibility: if ATR is below TP, hitting TP is less likely.
-    if atr_pct < MIN_MOVE_PCT:
+    ATR_TOLERANCE = 0.85  # soft relax
+
+if atr_pct < MIN_MOVE_PCT * ATR_TOLERANCE:
+
         return False, f"ATR_TOO_LOW atr%={atr_pct:.2f} < MIN_MOVE_PCT={MIN_MOVE_PCT:.2f}"
 
     assumed_gross_edge = TP_PCT
     assumed_cost = ESTIMATED_ROUNDTRIP_FEE_PCT + ESTIMATED_SLIPPAGE_PCT
     assumed_net = assumed_gross_edge - assumed_cost
 
-    if assumed_net < MIN_NET_PROFIT_PCT:
+logger.info(
+    f"[EDGE_CHECK] atr={atr_pct:.3f} min_move={MIN_MOVE_PCT:.3f} "
+    f"net={assumed_net:.3f} min_net={MIN_NET_PROFIT_PCT:.3f}"
+)
+
+EDGE_TOLERANCE = 0.85  # micro-relax
+
+if assumed_net < MIN_NET_PROFIT_PCT * EDGE_TOLERANCE:
+    return False, (
+        "EDGE_TOO_SMALL "
+        f"TP_PCT={assumed_gross_edge:.2f} cost={assumed_cost:.2f} net={assumed_net:.2f} "
+        f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
+    )
+
+
+    EDGE_TOLERANCE = 0.85  # micro-relax
+
+if assumed_net < MIN_NET_PROFIT_PCT * EDGE_TOLERANCE:
+
         return False, (
             "EDGE_TOO_SMALL "
             f"TP_PCT={assumed_gross_edge:.2f} cost={assumed_cost:.2f} net={assumed_net:.2f} "
@@ -218,8 +239,11 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
         )
 
     # Additional sanity: ATR should at least be in the ballpark of TP.
-    if atr_pct < (assumed_gross_edge * 0.75):
-        return False, f"ATR_BELOW_TP atr%={atr_pct:.2f} < 0.75*TP_PCT={assumed_gross_edge*0.75:.2f}"
+ATR_SANITY_TOLERANCE = 0.85  # soften third gate
+
+if atr_pct < (assumed_gross_edge * 0.75 * ATR_SANITY_TOLERANCE):
+    return False, f"ATR_BELOW_TP atr%={atr_pct:.2f} < 0.75*TP_PCT={assumed_gross_edge*0.75:.2f}"
+
 
     return True, "OK"
 
@@ -270,12 +294,17 @@ def _confidence_score(closes: List[float], ohlcv: List[List[float]]) -> float:
 
 
 def _risk_state(vol_regime: str, ai_score: float) -> str:
-    # minimal protective logic:
+    # minimal protective logic
     if vol_regime == "EXTREME":
         return "KILL"
-    if ai_score < 0.45:
+
+    AI_RISK_TOLERANCE = 0.95  # soft risk relax
+
+    if ai_score < (0.45 * AI_RISK_TOLERANCE):
         return "REDUCE"
+
     return "OK"
+
 
 
 def _cooldown_ok() -> bool:
@@ -475,4 +504,3 @@ def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     We ignore args/kwargs intentionally.
     """
     return generate_signal()
-
