@@ -32,14 +32,9 @@ GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == 
 GEN_TEST_SIGNAL = os.getenv("GEN_TEST_SIGNAL", "false").strip().lower() == "true"
 TEST_QUOTE_AMOUNT = float(os.getenv("TEST_QUOTE_AMOUNT", "5") or "5")
 
-# Guards / Edge
-MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.60"))
-MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
-BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.70"))
-ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
-ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
-TP_PCT = float(os.getenv("TP_PCT", "1.3"))
-MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
+# Simple extra gates (outside Excel)
+MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))          # % gap to avoid chop
+BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.70"))  # extra guard
 
 DEFAULT_OUTBOX = "/var/data/signal_outbox.json"
 
@@ -54,6 +49,10 @@ BYBIT_DEFAULT_TYPE = "swap" if MARKET_TYPE == "swap" else "spot"
 
 def _now_utc_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, float(x)))
 
 
 def _get_outbox_path(outbox_path: Optional[str]) -> str:
@@ -90,11 +89,7 @@ def _has_active_oco(symbol: str) -> bool:
 
 
 def _resolve_excel_path() -> str:
-    """
-    Prefer config.get_excel_model_path() if available, else EXCEL_MODEL_PATH env,
-    and fallback to known locations.
-    """
-    # 1) config getter (your fixed config.py can provide it)
+    # 1) config getter (if exists)
     try:
         from execution.config import get_excel_model_path  # type: ignore
         p = str(get_excel_model_path() or "").strip()
@@ -119,19 +114,7 @@ def _resolve_excel_path() -> str:
         if p and os.path.exists(p):
             return p
 
-    # debug dirs
-    try:
-        assets_list = os.listdir("/opt/render/project/src/assets")
-    except Exception:
-        assets_list = []
-    try:
-        var_data_list = os.listdir("/var/data")
-    except Exception:
-        var_data_list = []
-
-    raise FileNotFoundError(
-        f"EXCEL_MODEL_NOT_FOUND | env={env_path} | assets={assets_list} | var_data={var_data_list}"
-    )
+    raise FileNotFoundError(f"EXCEL_MODEL_NOT_FOUND | env={env_path}")
 
 
 def _core() -> ExcelLiveCore:
@@ -206,40 +189,54 @@ def _atr_pct(ohlcv: List[List[float]], n: int = 14) -> float:
     return (atr / last_close) * 100.0 if last_close else 0.0
 
 
-def _vol_regime(atr_pct: float) -> str:
-    if atr_pct >= 2.0:
-        return "EXTREME"
-    if atr_pct <= 0.30:
+def _vol_regime(atrp: float) -> str:
+    # Excel core expects: LOW / NORMAL / EXTREME
+    if atrp <= 0.30:
         return "LOW"
+    if atrp >= 2.00:
+        return "EXTREME"
     return "NORMAL"
 
 
-def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
-    if atr_pct < MIN_MOVE_PCT:
-        return False, f"ATR_TOO_LOW atr%={atr_pct:.2f} < MIN_MOVE_PCT={MIN_MOVE_PCT:.2f}"
-
-    assumed_gross_edge = TP_PCT
-    assumed_cost = ESTIMATED_ROUNDTRIP_FEE_PCT + ESTIMATED_SLIPPAGE_PCT
-    assumed_net = assumed_gross_edge - assumed_cost
-
-    if assumed_net < MIN_NET_PROFIT_PCT:
-        return False, (
-            "EDGE_TOO_SMALL "
-            f"TP_PCT={assumed_gross_edge:.2f} cost={assumed_cost:.2f} net={assumed_net:.2f} "
-            f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
-        )
-
-    if atr_pct < (assumed_gross_edge * 0.75):
-        return False, f"ATR_BELOW_TP atr%={atr_pct:.2f} < 0.75*TP_PCT={assumed_gross_edge * 0.75:.2f}"
-
-    return True, "OK"
-
-
-def _ma_gap_ok(last: float, ma20: float) -> Tuple[bool, str]:
+def _ma_gap_ok(last: float, ma20: float) -> bool:
     gap = abs(_pct(last, ma20))
-    if gap < MA_GAP_PCT:
-        return False, f"MA_GAP_TOO_SMALL gap%={gap:.3f} < MA_GAP_PCT={MA_GAP_PCT:.3f}"
-    return True, "OK"
+    return gap >= MA_GAP_PCT
+
+
+def _volume_score(ohlcv: List[List[float]]) -> float:
+    # volume ratio last / SMA20(vol) mapped to 0..1
+    vols = [float(x[5]) for x in ohlcv if len(x) > 5]
+    if not vols or len(vols) < 25:
+        return 0.50
+    v_last = float(vols[-1])
+    v_sma = float(_sma(vols, 20))
+    if v_sma <= 0:
+        return 0.50
+    ratio = v_last / v_sma
+    # 1.0 ratio => 0.66, 1.5 ratio => 1.0, 0.5 ratio => 0.33
+    return _clamp(ratio / 1.5, 0.0, 1.0)
+
+
+def _trend_strength(last: float, ma20: float, ma20_prev: float) -> float:
+    """
+    0..1 proxy:
+    - positive distance above MA20
+    - plus MA20 slope
+    """
+    dist = (last - ma20) / ma20 if ma20 else 0.0
+    slope = (ma20 - ma20_prev) / ma20_prev if ma20_prev else 0.0
+
+    # scale: 0..1% above MA maps towards 1
+    dist_score = _clamp(dist / 0.01, 0.0, 1.0)
+    # slope: 0..0.3% slope maps towards 1
+    slope_score = _clamp(slope / 0.003, 0.0, 1.0)
+
+    return _clamp(0.7 * dist_score + 0.3 * slope_score, 0.0, 1.0)
+
+
+def _confidence_score(trend_strength: float, vol_score: float) -> float:
+    # simple blended proxy (Excel still computes ai_score using weights)
+    return _clamp(0.65 * trend_strength + 0.35 * vol_score, 0.0, 1.0)
 
 
 def _build_trade_signal(symbol: str, direction: str, quote_amount: float) -> Dict[str, Any]:
@@ -264,7 +261,7 @@ def generate_signal(
     symbols_override: Optional[List[str]] = None
 ) -> bool:
     """
-    ✅ This signature matches main.py usage:
+    ✅ main.py compatibility:
         created = generate_once(outbox_path, symbols_override=active_symbols)
 
     Returns True if a signal was emitted, else False.
@@ -274,12 +271,11 @@ def generate_signal(
     if not _cooldown_ok():
         return False
 
-    # Decide symbols list
     symbols = symbols_override if (symbols_override and len(symbols_override) > 0) else _parse_symbols_from_env()
 
-    # Optional test signal
+    # optional test signal
     if GEN_TEST_SIGNAL:
-        sym = symbols[0] if symbols else "BTC/USDT:USDT"
+        sym = symbols[0] if symbols else "ETH/USDT:USDT"
         sid = f"TEST-{uuid.uuid4()}"
         test_sig = {
             "signal_id": sid,
@@ -293,18 +289,16 @@ def generate_signal(
         logger.info(f"[GEN] TEST_SIGNAL_EMITTED | id={sid} symbol={sym} outbox={outbox}")
         return True
 
-    # Live core
     core = _core()
 
     for symbol in symbols:
         active_oco = _has_active_oco(symbol)
-
         if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and active_oco:
             if GEN_LOG_EVERY_TICK:
                 logger.info(f"[GEN] BLOCK_ACTIVE_OCO | symbol={symbol}")
             continue
 
-        # Fetch OHLCV
+        # fetch OHLCV
         try:
             t0 = time.time()
             ohlcv = EX.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
@@ -321,67 +315,59 @@ def generate_signal(
         closes = [float(x[4]) for x in ohlcv]
         last = float(closes[-1])
         ma20 = float(_sma(closes, 20))
+        ma20_prev = float(_sma(closes[:-5], 20)) if len(closes) >= 30 else ma20
+
         atrp = float(_atr_pct(ohlcv, 14))
         vol_reg = _vol_regime(atrp)
 
-        edge_ok, edge_reason = _edge_ok(atrp)
-        mag_ok, mag_reason = _ma_gap_ok(last, ma20)
+        # build CoreInputs for your Excel core (THIS IS THE FIX)
+        vol_score = _volume_score(ohlcv)
+        trend = _trend_strength(last, ma20, ma20_prev)
+        struct_ok = (last > ma20) and _ma_gap_ok(last, ma20)
+        conf = _confidence_score(trend, vol_score)
 
-        # Excel decision
+        # extra guard from env (optional)
+        if conf < BUY_CONFIDENCE_MIN:
+            if GEN_LOG_EVERY_TICK:
+                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason=CONF_TOO_LOW conf={conf:.3f} < {BUY_CONFIDENCE_MIN:.3f}")
+            continue
+
+        inp = CoreInputs(
+            trend_strength=float(trend),
+            structure_ok=bool(struct_ok),
+            volume_score=float(vol_score),
+            risk_state="OK",
+            confidence_score=float(conf),
+            volatility_regime=str(vol_reg),
+            # pass ATR% as a "ratio proxy" (Excel default MIN_VOL_FOR_AGGRESSION=0.10)
+            volatility_ratio=float(atrp),
+        )
+
+        # core decision (dict)
         try:
-            inputs = CoreInputs(
-                symbol=symbol,
-                timeframe=TIMEFRAME,
-                last=last,
-                ma20=ma20,
-                atr_pct=atrp,
-            )
-            out = core.decide(inputs)
-
-            ai = float(getattr(out, "ai_confidence", 0.0) or 0.0)
-            macro = str(getattr(out, "macro_policy", "ALLOW") or "ALLOW")
-            strat = str(getattr(out, "strategy_flag", "NO") or "NO")
-            final = str(getattr(out, "final_trade_decision", "STAND_BY") or "STAND_BY")
-            risk = str(getattr(out, "risk_state", "OK") or "OK")
+            out = core.decide(inp)
+            ai = float(out.get("ai_score") or 0.0)
+            macro = str(out.get("macro_gate") or "ALLOW")
+            strat = str(out.get("active_strategy") or "NO")
+            final = str(out.get("final_trade_decision") or "STAND_BY")
+            adaptive_gate = float(out.get("adaptive_buy_gate") or 0.0)
         except Exception as e:
             logger.warning(f"[GEN] CORE_FAIL | symbol={symbol} err={e}")
             continue
 
         if GEN_LOG_EVERY_TICK:
             logger.info(
-                f"[GEN] CORE_DECISION | symbol={symbol} ai={ai:.3f} macro={macro} strat={strat} final={final} "
-                f"risk={risk} volReg={vol_reg} atr%={atrp:.2f} last={last:.4f} ma20={ma20:.4f} outbox={outbox}"
+                f"[GEN] CORE_DECISION | symbol={symbol} ai={ai:.3f} macro={macro} strat={strat} "
+                f"final={final} volReg={vol_reg} atr%={atrp:.2f} last={last:.4f} ma20={ma20:.4f} "
+                f"trend={trend:.3f} volScore={vol_score:.3f} conf={conf:.3f} gate={adaptive_gate:.3f} outbox={outbox}"
             )
 
-        # Macro + risk gate
-        if str(macro).upper() not in ("ALLOW", "ON", "TRUE"):
-            continue
-        if str(risk).upper() not in ("OK", "SAFE", "GREEN"):
-            continue
-
-        # Edge gates
-        if not edge_ok:
-            if GEN_LOG_EVERY_TICK:
-                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason={edge_reason}")
-            continue
-        if not mag_ok:
-            if GEN_LOG_EVERY_TICK:
-                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason={mag_reason}")
-            continue
-
-        # Confidence gate
-        if ai < BUY_CONFIDENCE_MIN:
-            if GEN_LOG_EVERY_TICK:
-                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason=AI_TOO_LOW ai={ai:.3f} < {BUY_CONFIDENCE_MIN:.3f}")
-            continue
-
-        # Final decision gate
-        if str(final).upper() != "EXECUTE":
-            continue
-
-        # Live generation gate
+        # gates
         if MODE == "LIVE" and not ALLOW_LIVE_SIGNALS:
             logger.warning(f"[GEN] LIVE_SIGNALS_BLOCKED | ALLOW_LIVE_SIGNALS=false | symbol={symbol}")
+            continue
+
+        if final.upper() != "EXECUTE":
             continue
 
         sig = _build_trade_signal(symbol=symbol, direction="LONG", quote_amount=BOT_QUOTE_PER_TRADE)
