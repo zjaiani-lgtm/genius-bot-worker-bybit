@@ -1,499 +1,416 @@
+# execution/signal_generator.py
 import os
-import math
+import time
+import uuid
 import logging
-from typing import Any, Dict, Optional, Set, Tuple
+from datetime import datetime
+from typing import Optional, Dict, Any, Tuple, List
 
 import ccxt
 
+from execution.signal_client import append_signal
+from execution.db.repository import has_active_oco_for_symbol
+from execution.excel_live_core import ExcelLiveCore, CoreInputs
+
 logger = logging.getLogger("gbm")
 
+# -----------------------------
+# ENV
+# -----------------------------
+MODE = os.getenv("MODE", "DEMO").strip().upper()
+TIMEFRAME = os.getenv("BOT_TIMEFRAME", "15m").strip()
+CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "80"))
+COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
 
-class ExchangeClientError(Exception):
-    pass
+ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() == "true"
+BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
+
+BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
+
+GEN_DEBUG = os.getenv("GEN_DEBUG", "true").strip().lower() == "true"
+GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == "true"
+GEN_TEST_SIGNAL = os.getenv("GEN_TEST_SIGNAL", "false").strip().lower() == "true"
+
+# Guards / Edge
+MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.60"))
+MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
+BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.70"))
+ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
+ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
+TP_PCT = float(os.getenv("TP_PCT", "1.3"))
+MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
+
+DEFAULT_OUTBOX = "/var/data/signal_outbox.json"
+
+_last_emit_ts: float = 0.0
+_CORE: Optional[ExcelLiveCore] = None
+
+# Exchange selection
+EXCHANGE_ID = (os.getenv("EXCHANGE") or os.getenv("EXCHANGE_ID") or "bybit").strip().lower()
+MARKET_TYPE = os.getenv("MARKET_TYPE", "swap").strip().lower()  # spot|swap
+BYBIT_DEFAULT_TYPE = "swap" if MARKET_TYPE == "swap" else "spot"
 
 
-class LiveTradingBlocked(Exception):
-    pass
+def _now_utc_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-def _to_bool(v: str, default: bool = False) -> bool:
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+def _get_outbox_path() -> str:
+    return (os.getenv("OUTBOX_PATH") or os.getenv("SIGNAL_OUTBOX_PATH") or DEFAULT_OUTBOX).strip()
 
 
-def _env(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
+def _parse_symbols() -> List[str]:
+    raw = (os.getenv("BOT_SYMBOLS") or os.getenv("SYMBOL_WHITELIST") or "BTC/USDT:USDT").strip()
+    syms = []
+    for s in raw.split(","):
+        s = s.strip()
+        if s:
+            syms.append(s)
+    return syms
 
 
-def _ceil_to_step(x: float, step: float) -> float:
-    if step is None or step <= 0:
-        return x
-    return math.ceil(x / step) * step
+def _cooldown_ok() -> bool:
+    global _last_emit_ts
+    if COOLDOWN_SECONDS <= 0:
+        return True
+    return (time.time() - _last_emit_ts) >= COOLDOWN_SECONDS
 
 
-def _infer_amount_step_from_precision(prec: Optional[int]) -> Optional[float]:
-    """
-    ccxt market['precision']['amount'] is typically number of decimals.
-    step = 10^-prec.
-    """
-    if prec is None:
-        return None
+def _emit(signal: Dict[str, Any], outbox_path: str) -> None:
+    global _last_emit_ts
+    append_signal(signal, outbox_path)
+    _last_emit_ts = time.time()
+
+
+def _has_active_oco(symbol: str) -> bool:
     try:
-        prec_int = int(prec)
-        if prec_int < 0:
-            return None
-        return 10 ** (-prec_int)
+        return bool(has_active_oco_for_symbol(symbol))
+    except Exception as e:
+        # safer: assume OCO active to avoid uncontrolled trades
+        logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | symbol={symbol} err={e} -> assume active_oco=True")
+        return True
+
+
+def _resolve_excel_path() -> str:
+    """
+    Prefer config.get_excel_model_path() if available, else EXCEL_MODEL_PATH env,
+    and fallback to known locations.
+    """
+    # 1) config getter (your fixed config.py can provide it)
+    try:
+        from execution.config import get_excel_model_path  # type: ignore
+        p = str(get_excel_model_path() or "").strip()
+        if p and os.path.exists(p):
+            return p
+        if p:
+            # config returned but doesn't exist -> continue to fallback
+            logger.warning(f"[GEN] EXCEL_PATH_MISSING_FROM_CONFIG | path={p}")
     except Exception:
-        return None
+        pass
+
+    # 2) env
+    env_path = os.getenv("EXCEL_MODEL_PATH", "").strip()
+    if env_path.lower().startswith("excel_model_path="):
+        env_path = env_path.split("=", 1)[1].strip()
+
+    candidates = [
+        env_path,
+        "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx",
+        "/opt/render/project/src/assets/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx",
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+
+    # debug info
+    try:
+        assets_list = os.listdir("/opt/render/project/src/assets")
+    except Exception:
+        assets_list = []
+    try:
+        var_data_list = os.listdir("/var/data")
+    except Exception:
+        var_data_list = []
+
+    raise FileNotFoundError(
+        f"EXCEL_MODEL_NOT_FOUND | env={env_path} | assets={assets_list} | var_data={var_data_list}"
+    )
 
 
-class UnifiedClient:
-    """
-    One client that supports:
-      - Binance Spot (native OCO supported)
-      - Bybit USDT Perp / Spot (NO native OCO -> TP/SL as 2 reduceOnly orders)
+def _core() -> ExcelLiveCore:
+    global _CORE
+    if _CORE is None:
+        path = _resolve_excel_path()
+        logger.info(f"[GEN] EXCEL_CORE_LOADED | path={path}")
+        _CORE = ExcelLiveCore(path)
+    return _CORE
 
-    Controlled by env:
-      MODE=DEMO|TESTNET|LIVE
-      EXCHANGE=binance|bybit
-      MARKET_TYPE=spot|swap  (default spot)
-    """
 
-    BINANCE_TESTNET_REST_BASE = "https://testnet.binance.vision/api"
+def _exchange() -> ccxt.Exchange:
+    cls = getattr(ccxt, EXCHANGE_ID)
 
-    def __init__(self):
-        # ---- core guards ----
-        self.mode = _env("MODE", "DEMO").upper()  # DEMO | TESTNET | LIVE
-        self.kill_switch = _to_bool(_env("KILL_SWITCH", "false"))
-        self.live_confirmation = _to_bool(_env("LIVE_CONFIRMATION", "false"))
+    # Keys are optional for OHLCV, but keep them if set (for some endpoints)
+    api_key = os.getenv("BYBIT_API_KEY" if EXCHANGE_ID == "bybit" else "BINANCE_API_KEY", "").strip()
+    api_secret = os.getenv("BYBIT_API_SECRET" if EXCHANGE_ID == "bybit" else "BINANCE_API_SECRET", "").strip()
 
-        # ---- trading constraints ----
-        self.max_quote_per_trade = float(_env("MAX_QUOTE_PER_TRADE", "10") or "10")
-        self.symbol_whitelist: Set[str] = set(
-            s.strip().upper()
-            for s in _env("SYMBOL_WHITELIST", "BTC/USDT").split(",")
-            if s.strip()
-        )
+    ex = cls({
+        "enableRateLimit": True,
+        "apiKey": api_key,
+        "secret": api_secret,
+        "options": {},
+    })
 
-        # ---- exchange selection ----
-        self.exchange_name = _env("EXCHANGE", "binance").lower()  # binance | bybit
-        self.market_type = _env("MARKET_TYPE", "spot").lower()    # spot | swap
+    # Bybit market type tuning for symbols like BTC/USDT:USDT
+    if EXCHANGE_ID == "bybit":
+        ex.options["defaultType"] = BYBIT_DEFAULT_TYPE
+        # these help with linear USDT perp in some ccxt versions
+        ex.options["defaultSubType"] = "linear"
 
-        # init ccxt exchange
-        self.exchange = self._build_exchange()
-
-        # warm up markets for precision helpers
-        try:
-            self.exchange.load_markets()
-        except Exception as e:
-            logger.warning(f"LOAD_MARKETS_WARN | exchange={self.exchange_name} err={e}")
-
-    # ----------------------------
-    # Build exchange (ccxt)
-    # ----------------------------
-    def _build_exchange(self):
-        if self.exchange_name == "binance":
-            api_key = _env("BINANCE_API_KEY", "")
-            api_secret = _env("BINANCE_API_SECRET", "")
-
-            if self.mode in ("LIVE", "TESTNET"):
-                if not api_key or not api_secret:
-                    raise ExchangeClientError("Missing BINANCE_API_KEY / BINANCE_API_SECRET for LIVE/TESTNET.")
-
-            ex = ccxt.binance({
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
-                "options": {"defaultType": "spot"},  # spot-only here
-            })
-
-            # TESTNET handling
-            if self.mode == "TESTNET":
-                ex.urls["api"] = {
-                    "public": self.BINANCE_TESTNET_REST_BASE,
-                    "private": self.BINANCE_TESTNET_REST_BASE,
-                }
-                ex.options["fetchCurrencies"] = False
-
-            return ex
-
-        if self.exchange_name == "bybit":
-            api_key = _env("BYBIT_API_KEY", "")
-            api_secret = _env("BYBIT_API_SECRET", "")
-
-            if self.mode in ("LIVE", "TESTNET"):
-                if not api_key or not api_secret:
-                    raise ExchangeClientError("Missing BYBIT_API_KEY / BYBIT_API_SECRET for LIVE/TESTNET.")
-
-            default_type = "swap" if self.market_type == "swap" else "spot"
-
-            ex = ccxt.bybit({
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
-                "options": {"defaultType": default_type},
-            })
-
-            if self.mode == "TESTNET":
-                try:
-                    ex.set_sandbox_mode(True)
-                except Exception as e:
-                    logger.warning(f"BYBIT_SANDBOX_WARN | err={e}")
-
-            return ex
-
-        raise ExchangeClientError(f"Unsupported EXCHANGE={self.exchange_name}. Use binance|bybit.")
-
-    # ----------------------------
-    # Guards / diagnostics
-    # ----------------------------
-    def _guard(self, symbol: str, quote_amount: Optional[float] = None) -> None:
-        if self.kill_switch:
-            raise LiveTradingBlocked("KILL_SWITCH is ON.")
-        if self.mode == "LIVE" and not self.live_confirmation:
-            raise LiveTradingBlocked("LIVE_CONFIRMATION is OFF.")
-        if self.mode == "DEMO":
-            raise LiveTradingBlocked("MODE=DEMO -> exchange client must not execute real orders.")
-        if symbol and symbol.upper() not in self.symbol_whitelist:
-            raise LiveTradingBlocked(f"Symbol not allowed by whitelist: {symbol}.")
-        if quote_amount is not None and quote_amount > self.max_quote_per_trade:
-            raise LiveTradingBlocked(
-                f"quote_amount {quote_amount} exceeds MAX_QUOTE_PER_TRADE={self.max_quote_per_trade}"
-            )
-
-    def diagnostics(self) -> Dict[str, Any]:
-        try:
-            bal = self.exchange.fetch_balance()
-            sym = next(iter(self.symbol_whitelist)) if self.symbol_whitelist else "BTC/USDT"
-            t = self.exchange.fetch_ticker(sym)
-            usdt_free = float((bal.get("free", {}) or {}).get("USDT", 0.0) or 0.0)
-            return {
-                "exchange": self.exchange_name,
-                "market_type": self.market_type,
-                "mode": self.mode,
-                "kill_switch": self.kill_switch,
-                "live_confirmation": self.live_confirmation,
-                "symbol_probe": sym,
-                "last_price": float(t.get("last") or 0.0),
-                "usdt_free": usdt_free,
-                "ok": True,
-            }
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
-    # ----------------------------
-    # Market helpers
-    # ----------------------------
-    def fetch_last_price(self, symbol: str) -> float:
-        t = self.exchange.fetch_ticker(symbol)
-        return float(t["last"])
-
-    def fetch_balance_free(self, asset: str) -> float:
-        bal = self.exchange.fetch_balance()
-        return float((bal.get("free", {}) or {}).get(asset.upper(), 0.0) or 0.0)
-
-    def fetch_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        return self.exchange.fetch_order(str(order_id), symbol)
-
-    def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        return self.exchange.cancel_order(str(order_id), symbol)
-
-    def get_min_notional(self, symbol: str) -> float:
-        """
-        Return minimum notional/cost. Binance has MIN_NOTIONAL/NOTIONAL filters.
-        Bybit mostly exposes min cost in ccxt normalized market limits (if available).
-        """
-        try:
-            m = self.exchange.market(symbol)
-
-            cost_min = (((m.get("limits") or {}).get("cost") or {}).get("min"))
-            if cost_min is not None:
-                return float(cost_min)
-
-            if self.exchange_name == "binance":
-                info = m.get("info") or {}
-                filters = info.get("filters") or []
-                for f in filters:
-                    t = str(f.get("filterType") or "").upper()
-                    if t in ("MIN_NOTIONAL", "NOTIONAL"):
-                        v = f.get("minNotional")
-                        if v is None:
-                            v = f.get("minNotionalValue")
-                        if v is None:
-                            v = f.get("notional")
-                        if v is not None:
-                            return float(v)
-        except Exception as e:
-            logger.warning(f"MIN_NOTIONAL_LOOKUP_FAIL | exchange={self.exchange_name} symbol={symbol} err={e}")
-
-        return 0.0
-
-    # ----------------------------
-    # Precision helpers
-    # ----------------------------
-    def floor_amount(self, symbol: str, amount: float) -> float:
-        try:
-            s = self.exchange.amount_to_precision(symbol, amount)
-            return float(s)
-        except Exception:
-            return float(amount)
-
-    def floor_price(self, symbol: str, price: float) -> float:
-        try:
-            s = self.exchange.price_to_precision(symbol, price)
-            return float(s)
-        except Exception:
-            return float(price)
-
-    def _amount_str(self, symbol: str, amount: float) -> str:
-        return str(self.exchange.amount_to_precision(symbol, amount))
-
-    def _price_str(self, symbol: str, price: float) -> str:
-        return str(self.exchange.price_to_precision(symbol, price))
-
-    # ----------------------------
-    # Orders
-    # ----------------------------
-    def _bybit_min_constraints(self, symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-        """
-        Returns: (min_base_amount, min_cost, amount_step)
-        All may be None if exchange doesn't expose.
-        """
-        try:
-            m = self.exchange.market(symbol)
-            limits = m.get("limits") or {}
-            amt_min = ((limits.get("amount") or {}).get("min"))
-            cost_min = ((limits.get("cost") or {}).get("min"))
-            prec_amt = (m.get("precision") or {}).get("amount")
-            step = _infer_amount_step_from_precision(prec_amt)
-
-            min_base = float(amt_min) if amt_min is not None else None
-            min_cost = float(cost_min) if cost_min is not None else None
-            return min_base, min_cost, step
-        except Exception:
-            return None, None, None
-
-    def place_market_buy_by_quote(self, symbol: str, quote_amount: float) -> Dict[str, Any]:
-        """
-        Binance spot: uses quoteOrderQty (best)
-        Bybit: calculates base qty = quote_amount / last_price
-        Adds: min amount / min cost checks (prevents "precision 0.001" failures)
-        """
-        self._guard(symbol, quote_amount=quote_amount)
-
-        try:
-            # Ensure markets are loaded for limits/precision
+        if MODE == "TESTNET":
             try:
-                if not getattr(self.exchange, "markets", None):
-                    self.exchange.load_markets()
+                ex.set_sandbox_mode(True)
             except Exception:
                 pass
 
-            if self.exchange_name == "binance":
-                params = {"quoteOrderQty": float(quote_amount)}
-                return self.exchange.create_order(symbol, "market", "buy", None, None, params)
+    try:
+        ex.load_markets()
+    except Exception as e:
+        logger.warning(f"[GEN] LOAD_MARKETS_WARN | exchange={EXCHANGE_ID} err={e}")
 
-            # ---- BYBIT sizing ----
-            last = self.fetch_last_price(symbol)
-            if last <= 0:
-                raise ExchangeClientError("Invalid last price for sizing.")
-
-            min_base, min_cost, step = self._bybit_min_constraints(symbol)
-
-            base_raw = float(quote_amount) / float(last)
-
-            # If exchange exposes min_cost, enforce it first
-            if min_cost is not None:
-                # add tiny buffer for price movement
-                if float(quote_amount) < float(min_cost) * 1.01:
-                    raise ExchangeClientError(
-                        f"BUY_BLOCKED_MIN_COST | symbol={symbol} need_quote>={float(min_cost):.4f} "
-                        f"have={float(quote_amount):.4f}"
-                    )
-
-            # If exchange exposes min_base, ensure quote can reach it
-            if min_base is not None:
-                need_quote_for_min = float(min_base) * float(last) * 1.02
-                if float(quote_amount) < need_quote_for_min:
-                    raise ExchangeClientError(
-                        f"BUY_BLOCKED_MIN_AMOUNT | symbol={symbol} min_base={float(min_base):.6f} "
-                        f"last={float(last):.2f} need_quote>={need_quote_for_min:.2f} have={float(quote_amount):.2f}"
-                    )
-                base_raw = max(base_raw, float(min_base))
-
-            # Floor to precision (may round DOWN)
-            base_amt = self.floor_amount(symbol, base_raw)
-
-            # If rounding down made it smaller than min_base, bump UP to step or min_base
-            if min_base is not None and float(base_amt) < float(min_base):
-                if step is not None:
-                    base_amt = _ceil_to_step(float(base_amt), float(step))
-                base_amt = max(float(base_amt), float(min_base))
-                # after bump, re-apply precision formatting
-                base_amt = float(self.exchange.amount_to_precision(symbol, base_amt))
-
-            if base_amt <= 0:
-                raise ExchangeClientError("Computed base amount <= 0 after precision.")
-
-            logger.info(
-                f"BUY_SIZE_DEBUG | exchange=bybit symbol={symbol} quote={float(quote_amount):.4f} "
-                f"last={float(last):.2f} base_raw={base_raw:.8f} base_final={float(base_amt):.8f} "
-                f"min_base={min_base} min_cost={min_cost} step={step}"
-            )
-
-            return self.exchange.create_order(symbol, "market", "buy", float(base_amt), None, {})
-
-        except LiveTradingBlocked:
-            raise
-        except ExchangeClientError:
-            raise
-        except Exception as e:
-            raise ExchangeClientError(f"Market buy failed: {e}")
-
-    def place_market_sell(self, symbol: str, base_amount: float) -> Dict[str, Any]:
-        self._guard(symbol)
-        try:
-            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
-            return self.exchange.create_order(symbol, "market", "sell", float(amt), None)
-        except LiveTradingBlocked:
-            raise
-        except Exception as e:
-            raise ExchangeClientError(f"Market sell failed: {e}")
-
-    def place_limit_sell_amount(
-        self, symbol: str, base_amount: float, price: float, reduce_only: bool = False
-    ) -> Dict[str, Any]:
-        self._guard(symbol)
-        try:
-            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
-            px = float(self.exchange.price_to_precision(symbol, price))
-            params = {}
-            if reduce_only:
-                params["reduceOnly"] = True
-            return self.exchange.create_order(symbol, "limit", "sell", float(amt), float(px), params)
-        except LiveTradingBlocked:
-            raise
-        except Exception as e:
-            raise ExchangeClientError(f"Limit sell failed: {e}")
-
-    def place_stop_loss_limit_sell(self, symbol: str, base_amount: float, stop_price: float, limit_price: float) -> Dict[str, Any]:
-        """
-        Binance-only STOP_LOSS_LIMIT in spot.
-        """
-        self._guard(symbol)
-        if self.exchange_name != "binance":
-            raise ExchangeClientError("STOP_LOSS_LIMIT sell is Binance-spot specific. Use place_stop_loss_market_sell for Bybit.")
-        try:
-            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
-            stop_px = float(self.exchange.price_to_precision(symbol, stop_price))
-            limit_px = float(self.exchange.price_to_precision(symbol, limit_price))
-            params = {"stopPrice": stop_px, "timeInForce": "GTC"}
-            return self.exchange.create_order(symbol, "STOP_LOSS_LIMIT", "sell", float(amt), float(limit_px), params)
-        except LiveTradingBlocked:
-            raise
-        except Exception as e:
-            raise ExchangeClientError(f"Stop-loss-limit sell failed: {e}")
-
-    def place_stop_loss_market_sell(self, symbol: str, base_amount: float, stop_price: float, reduce_only: bool = True) -> Dict[str, Any]:
-        """
-        Futures-friendly stop market.
-        """
-        self._guard(symbol)
-        try:
-            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
-            trigger = float(self.exchange.price_to_precision(symbol, stop_price))
-            params = {"reduceOnly": bool(reduce_only), "triggerPrice": trigger}
-            params.setdefault("triggerDirection", 2)  # fall for SL on long
-            return self.exchange.create_order(symbol, "market", "sell", float(amt), None, params)
-        except LiveTradingBlocked:
-            raise
-        except Exception as e:
-            raise ExchangeClientError(f"Stop-loss market sell failed: {e}")
-
-    # ----------------------------
-    # Binance native OCO
-    # ----------------------------
-    def place_oco_sell(self, symbol: str, base_amount: float, tp_price: float, sl_stop_price: float, sl_limit_price: float) -> Dict[str, Any]:
-        """
-        Native Binance Spot OCO.
-        IMPORTANT: use STRING precision to avoid -1111 precision errors.
-        """
-        self._guard(symbol)
-
-        if self.exchange_name != "binance":
-            raise ExchangeClientError("Native OCO is Binance-spot only. Use place_tp_sl_orders_for_long() for Bybit.")
-
-        try:
-            qty = self._amount_str(symbol, base_amount)
-            price = self._price_str(symbol, tp_price)
-            stop_price = self._price_str(symbol, sl_stop_price)
-            stop_limit_price = self._price_str(symbol, sl_limit_price)
-
-            payload = {
-                "symbol": self.exchange.market_id(symbol),
-                "side": "SELL",
-                "quantity": qty,
-                "price": price,
-                "stopPrice": stop_price,
-                "stopLimitPrice": stop_limit_price,
-                "stopLimitTimeInForce": "GTC",
-            }
-
-            res = self.exchange.privatePostOrderOco(payload)
-            return {"raw": res}
-        except LiveTradingBlocked:
-            raise
-        except Exception as e:
-            raise ExchangeClientError(f"OCO sell failed: {e}")
-
-    # ----------------------------
-    # Bybit-friendly TP/SL-first (2 orders)
-    # ----------------------------
-    def place_tp_sl_orders_for_long(
-        self,
-        symbol: str,
-        base_amount: float,
-        tp_price: float,
-        sl_stop_price: float,
-    ) -> Dict[str, Any]:
-        """
-        For Bybit (and generally futures): place TP limit sell + SL stop-market sell (reduceOnly).
-        Returns: {"tp": <order>, "sl": <order>}
-        """
-        self._guard(symbol)
-        try:
-            amt = float(self.exchange.amount_to_precision(symbol, base_amount))
-            tp_px = float(self.exchange.price_to_precision(symbol, tp_price))
-            sl_trigger = float(self.exchange.price_to_precision(symbol, sl_stop_price))
-
-            tp = self.exchange.create_order(
-                symbol, "limit", "sell", float(amt), float(tp_px),
-                {"reduceOnly": True}
-            )
-
-            sl = self.exchange.create_order(
-                symbol, "market", "sell", float(amt), None,
-                {
-                    "reduceOnly": True,
-                    "triggerPrice": sl_trigger,
-                    "triggerDirection": 2,  # fall
-                }
-            )
-
-            return {"tp": tp, "sl": sl}
-        except LiveTradingBlocked:
-            raise
-        except Exception as e:
-            raise ExchangeClientError(f"TP/SL orders failed: {e}")
+    return ex
 
 
-def get_exchange_client() -> UnifiedClient:
+EX = _exchange()
+
+
+def _pct(a: float, b: float) -> float:
+    if not b:
+        return 0.0
+    return (float(a) - float(b)) / float(b) * 100.0
+
+
+def _sma(vals: List[float], n: int) -> float:
+    if not vals:
+        return 0.0
+    if len(vals) < n:
+        return sum(vals) / max(1, len(vals))
+    w = vals[-n:]
+    return sum(w) / n
+
+
+def _atr_pct(ohlcv: List[List[float]], n: int = 14) -> float:
+    if len(ohlcv) < n + 1:
+        return 0.0
+    trs = []
+    for i in range(-n, 0):
+        high = float(ohlcv[i][2])
+        low = float(ohlcv[i][3])
+        prev_close = float(ohlcv[i - 1][4])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    atr = sum(trs) / n
+    last_close = float(ohlcv[-1][4])
+    return (atr / last_close) * 100.0 if last_close else 0.0
+
+
+def _vol_regime(atr_pct: float) -> str:
+    if atr_pct >= 2.0:
+        return "EXTREME"
+    if atr_pct <= 0.30:
+        return "LOW"
+    return "NORMAL"
+
+
+def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
+    if atr_pct < MIN_MOVE_PCT:
+        return False, f"ATR_TOO_LOW atr%={atr_pct:.2f} < MIN_MOVE_PCT={MIN_MOVE_PCT:.2f}"
+
+    assumed_gross_edge = TP_PCT
+    assumed_cost = ESTIMATED_ROUNDTRIP_FEE_PCT + ESTIMATED_SLIPPAGE_PCT
+    assumed_net = assumed_gross_edge - assumed_cost
+
+    if assumed_net < MIN_NET_PROFIT_PCT:
+        return False, (
+            "EDGE_TOO_SMALL "
+            f"TP_PCT={assumed_gross_edge:.2f} cost={assumed_cost:.2f} net={assumed_net:.2f} "
+            f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
+        )
+
+    if atr_pct < (assumed_gross_edge * 0.75):
+        return False, f"ATR_BELOW_TP atr%={atr_pct:.2f} < 0.75*TP_PCT={assumed_gross_edge * 0.75:.2f}"
+
+    return True, "OK"
+
+
+def _ma_gap_ok(last: float, ma20: float) -> Tuple[bool, str]:
+    gap = abs(_pct(last, ma20))
+    if gap < MA_GAP_PCT:
+        return False, f"MA_GAP_TOO_SMALL gap%={gap:.3f} < MA_GAP_PCT={MA_GAP_PCT:.3f}"
+    return True, "OK"
+
+
+def _build_trade_signal(symbol: str, direction: str, quote_amount: float) -> Dict[str, Any]:
+    sid = f"DYZEN-{uuid.uuid4().hex[:14]}"
+    return {
+        "signal_id": sid,
+        "ts_utc": _now_utc_iso(),
+        "source": "EXCEL_LIVE_CORE",
+        "final_verdict": "TRADE",
+        "direction": direction,
+        "execution": {
+            "symbol": symbol,
+            "side": "BUY" if direction.upper() == "LONG" else "SELL",
+            "quote_amount": float(quote_amount),
+        },
+    }
+
+
+def generate_signal() -> Optional[Dict[str, Any]]:
     """
-    Factory function for the rest of your codebase.
+    Legacy API (some main.py expects this).
+    Creates at most 1 signal per call.
     """
-    return UnifiedClient()
+    outbox_path = _get_outbox_path()
+
+    if not _cooldown_ok():
+        return None
+
+    symbols = _parse_symbols()
+    core = _core()
+
+    for symbol in symbols:
+        active_oco = _has_active_oco(symbol)
+
+        # Optional risk-first gate
+        if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and active_oco:
+            if GEN_LOG_EVERY_TICK:
+                logger.info(f"[GEN] BLOCK_ACTIVE_OCO | symbol={symbol}")
+            continue
+
+        # Fetch OHLCV
+        try:
+            t0 = time.time()
+            ohlcv = EX.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+            dt_ms = int((time.time() - t0) * 1000)
+            if GEN_DEBUG:
+                logger.info(f"[GEN] FETCH_OK | symbol={symbol} tf={TIMEFRAME} candles={len(ohlcv) if ohlcv else 0} dt={dt_ms}ms")
+        except Exception as e:
+            logger.warning(f"[GEN] FETCH_FAIL | symbol={symbol} tf={TIMEFRAME} err={e}")
+            continue
+
+        if not ohlcv or len(ohlcv) < 25:
+            continue
+
+        closes = [float(x[4]) for x in ohlcv]
+        last = float(closes[-1])
+        ma20 = float(_sma(closes, 20))
+        atrp = float(_atr_pct(ohlcv, 14))
+        vol_reg = _vol_regime(atrp)
+
+        edge_ok, edge_reason = _edge_ok(atrp)
+        mag_ok, mag_reason = _ma_gap_ok(last, ma20)
+
+        # Excel decision
+        try:
+            inputs = CoreInputs(
+                symbol=symbol,
+                timeframe=TIMEFRAME,
+                last=last,
+                ma20=ma20,
+                atr_pct=atrp,
+            )
+            core_out = core.decide(inputs)
+            # expected keys: ai_confidence, macro_policy, strategy_flag, final_trade_decision, risk_state
+            ai = float(getattr(core_out, "ai_confidence", 0.0) or 0.0)
+            macro = str(getattr(core_out, "macro_policy", "ALLOW") or "ALLOW")
+            strat = str(getattr(core_out, "strategy_flag", "NO") or "NO")
+            final = str(getattr(core_out, "final_trade_decision", "STAND_BY") or "STAND_BY")
+            risk = str(getattr(core_out, "risk_state", "OK") or "OK")
+        except Exception as e:
+            logger.warning(f"[GEN] CORE_FAIL | symbol={symbol} err={e}")
+            continue
+
+        # Macro + risk gate
+        if str(macro).upper() not in ("ALLOW", "ON", "TRUE"):
+            if GEN_LOG_EVERY_TICK:
+                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason=MACRO_BLOCK macro={macro}")
+            continue
+        if str(risk).upper() not in ("OK", "SAFE", "GREEN"):
+            if GEN_LOG_EVERY_TICK:
+                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason=RISK_BLOCK risk={risk}")
+            continue
+
+        # Edge gates
+        if not edge_ok:
+            if GEN_LOG_EVERY_TICK:
+                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason={edge_reason} atr%={atrp:.2f} volReg={vol_reg}")
+            continue
+        if not mag_ok:
+            if GEN_LOG_EVERY_TICK:
+                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason={mag_reason} last={last:.4f} ma20={ma20:.4f}")
+            continue
+
+        # Confidence gate
+        if ai < BUY_CONFIDENCE_MIN:
+            if GEN_LOG_EVERY_TICK:
+                logger.info(f"[GEN] STAND_BY | symbol={symbol} reason=AI_TOO_LOW ai={ai:.3f} < {BUY_CONFIDENCE_MIN:.3f}")
+            continue
+
+        # Final decision gate
+        if str(final).upper() != "EXECUTE":
+            if GEN_LOG_EVERY_TICK:
+                logger.info(
+                    f"[GEN] CORE_DECISION | symbol={symbol} ai={ai:.3f} macro={macro} strat={strat} "
+                    f"final={final} risk={risk} volReg={vol_reg} atr%={atrp:.2f} last={last:.4f} ma20={ma20:.4f} "
+                    f"outbox={outbox_path}"
+                )
+            continue
+
+        # Live generation gate
+        if MODE == "LIVE" and not ALLOW_LIVE_SIGNALS:
+            logger.warning(f"[GEN] LIVE_SIGNALS_BLOCKED | ALLOW_LIVE_SIGNALS=false | symbol={symbol}")
+            continue
+
+        sig = _build_trade_signal(symbol=symbol, direction="LONG", quote_amount=BOT_QUOTE_PER_TRADE)
+        _emit(sig, outbox_path)
+        logger.info(f"[GEN] SIGNAL_EMITTED | id={sig['signal_id']} symbol={symbol} quote={BOT_QUOTE_PER_TRADE} outbox={outbox_path}")
+        return sig
+
+    return None
 
 
-# Backward compatibility alias
-BinanceSpotClient = UnifiedClient
+def run_once(outbox_path: str, symbols_override: Optional[List[str]] = None) -> bool:
+    """
+    New API (your newer main.py uses this).
+    Returns True if a signal was created.
+    """
+    # override outbox if passed
+    if outbox_path:
+        os.environ["SIGNAL_OUTBOX_PATH"] = str(outbox_path)
+
+    if symbols_override:
+        # turn list into BOT_SYMBOLS for this tick only
+        os.environ["BOT_SYMBOLS"] = ",".join([str(s).strip() for s in symbols_override if str(s).strip()])
+
+    # test signal (optional)
+    if GEN_TEST_SIGNAL:
+        sid = f"TEST-{uuid.uuid4()}"
+        sym = (symbols_override[0] if symbols_override else (_parse_symbols()[0] if _parse_symbols() else "BTC/USDT:USDT"))
+        test_sig = {
+            "signal_id": sid,
+            "ts_utc": _now_utc_iso(),
+            "source": "TEST",
+            "final_verdict": "TRADE",
+            "direction": "LONG",
+            "execution": {"symbol": sym, "side": "BUY", "quote_amount": float(os.getenv("TEST_QUOTE_AMOUNT", "5") or "5")},
+        }
+        _emit(test_sig, _get_outbox_path())
+        logger.info(f"[GEN] TEST_SIGNAL_EMITTED | id={sid} symbol={sym} outbox={_get_outbox_path()}")
+        return True
+
+    sig = generate_signal()
+    return bool(sig)
+
+
+# Backward-compat alias (some older code imports generate_once)
+generate_once = run_once
