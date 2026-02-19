@@ -215,3 +215,74 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
         "last": last,
         "ma20": ma20,
     }
+
+
+# ===================== SIGNAL GENERATION =====================
+
+def generate_signals():
+    """Main signal generation loop"""
+    symbols = os.getenv("BOT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+    symbols = [s.strip() for s in symbols if s.strip()]
+
+    logger.info(f"Signal Generator | symbols={symbols}")
+
+    for symbol in symbols:
+        try:
+            if not _cooldown_ok():
+                logger.debug(f"SIGNAL_GEN | {symbol} cooldown active")
+                continue
+
+            snapshot = _fetch_snapshot(symbol)
+            logger.info(f"SIGNAL_SNAPSHOT | {symbol} -> {snapshot}")
+
+            # Check if we should generate signal
+            if not ALLOW_LIVE_SIGNALS:
+                logger.info(f"SIGNAL_GEN | LIVE signals disabled -> skip")
+                continue
+
+            # Check for active OCO
+            if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and has_active_oco_for_symbol(symbol):
+                logger.info(f"SIGNAL_GEN | {symbol} has active OCO -> skip")
+                continue
+
+            # Generate signal if conditions met
+            if snapshot["structure_ok"] and snapshot["confidence_score"] > 0.6:
+                signal = {
+                    "id": str(uuid.uuid4()),
+                    "timestamp": _now_utc_iso(),
+                    "symbol": symbol,
+                    "direction": "LONG" if snapshot["trend_strength"] > 0.5 else "SHORT",
+                    "confidence": snapshot["confidence_score"],
+                    "quote_amount": BOT_QUOTE_PER_TRADE,
+                    "risk_state": snapshot["risk_state"],
+                    "volatility_regime": snapshot["volatility_regime"],
+                }
+
+                logger.info(f"SIGNAL_EMIT | {signal}")
+                append_signal(signal)
+                _mark_emitted()
+
+        except Exception as e:
+            logger.error(f"SIGNAL_GEN | {symbol} ERROR={e}")
+
+
+# ===================== MAIN =====================
+
+def main():
+    """Entry point for signal generator"""
+    logger.info(f"SIGNAL_GENERATOR | starting")
+    logger.info(f"EXCEL_MODEL_PATH={EXCEL_MODEL_PATH}")
+    logger.info(f"ALLOW_LIVE_SIGNALS={ALLOW_LIVE_SIGNALS}")
+    logger.info(f"TIMEFRAME={TIMEFRAME}")
+
+    while True:
+        try:
+            generate_signals()
+        except Exception as e:
+            logger.error(f"SIGNAL_GENERATOR main loop error={e}", exc_info=True)
+
+        time.sleep(int(os.getenv("BOT_SIGNAL_LOOP_SLEEP_SECONDS", "30")))
+
+
+if __name__ == "__main__":
+    main()
