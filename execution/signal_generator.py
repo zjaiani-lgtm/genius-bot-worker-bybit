@@ -152,15 +152,35 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
 # ===================== SIGNAL GENERATION =====================
 
 def generate_signals():
-    symbols = os.getenv("BOT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
-    symbols = [s.strip() for s in symbols if s.strip()]
+    def _normalize_symbol(sym: str) -> str:
+    """Convert BTCUSDT -> BTC/USDT safely"""
+    sym = sym.strip().upper()
+    if "/" in sym:
+        return sym
+    if sym.endswith("USDT"):
+        return sym[:-4] + "/USDT"
+    return sym
+
+
+def generate_signals():
+    raw_symbols = os.getenv("BOT_SYMBOLS", "BTCUSDT,ETHUSDT")
+    symbols = [_normalize_symbol(s) for s in raw_symbols.split(",") if s.strip()]
+
+    logger.info(f"[GEN] SYMBOLS | raw={raw_symbols} normalized={symbols}")
+    logger.info(f"[GEN] LIVE_ENABLED={ALLOW_LIVE_SIGNALS}")
 
     for symbol in symbols:
         try:
             if not _cooldown_ok():
+                logger.debug(f"[GEN] {symbol} cooldown active")
                 continue
 
             snap = _fetch_snapshot(symbol)
+
+            logger.info(
+                f"[GEN] SNAPSHOT | {symbol} trend={snap['trend_strength']:.3f} "
+                f"struct={snap['structure_ok']} conf={snap['confidence_score']:.3f}"
+            )
 
             core = _core()
             decision = core.evaluate(
@@ -177,14 +197,15 @@ def generate_signals():
             logger.info(
                 f"[GEN] CORE_DECISION | symbol={symbol} ai={decision.ai_score:.3f} "
                 f"macro={decision.macro_gate} strat={decision.active_strategy} "
-                f"final={decision.final_decision} risk={decision.risk_state} "
-                f"volReg={snap['volatility_regime']} last={snap['last']:.2f}"
+                f"final={decision.final_decision} risk={decision.risk_state}"
             )
 
             if not ALLOW_LIVE_SIGNALS:
+                logger.warning("[GEN] LIVE DISABLED -> skipping emit")
                 continue
 
             if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and has_active_oco_for_symbol(symbol):
+                logger.info(f"[GEN] {symbol} active OCO -> skip")
                 continue
 
             if decision.final_decision != "EXECUTE":
@@ -203,9 +224,11 @@ def generate_signals():
 
             append_signal(signal)
             _mark_emitted()
+            logger.info(f"[GEN] SIGNAL_EMITTED | {symbol}")
 
         except Exception as e:
             logger.error(f"[GEN] {symbol} ERROR={e}", exc_info=True)
+
 
 
 # ===================== MAIN =====================
@@ -219,3 +242,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
