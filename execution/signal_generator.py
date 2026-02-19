@@ -31,7 +31,7 @@ MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.60"))
 MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
 
 # If your core confidence is below this, we skip (extra guard on top of Excel).
-BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.70"))
+BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.52"))
 
 # Expected round-trip cost model (VERY important for micro-scalps)
 # Example: taker 0.10% in + 0.10% out => 0.20%. If you are mostly maker, reduce this.
@@ -475,3 +475,4 @@ def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     We ignore args/kwargs intentionally.
     """
     return generate_signal()
+
