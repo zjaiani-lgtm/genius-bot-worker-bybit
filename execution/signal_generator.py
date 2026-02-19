@@ -94,35 +94,34 @@ def _read_excel_confidence() -> float:
         ws = _EXCEL_WB["AI_MASTER_LIVE_DECISION"]
 
         # ===== HEDGE AUTO-DETECT CONF COLUMN =====
-key = None
+        key = None
 
-CONF_ALIASES = [
-    "confidence",
-    "ai confidence",
-    "ai score",
-    "score",
-]
+        CONF_ALIASES = [
+            "confidence",
+            "ai confidence",
+            "ai score",
+            "score",
+        ]
 
-for k in _EXCEL_HEADERS.keys():
-    kl = str(k).lower()
-    if any(alias in kl for alias in CONF_ALIASES):
-        key = k
-        break
+        for k in _EXCEL_HEADERS.keys():
+            kl = str(k).lower()
+            if any(alias in kl for alias in CONF_ALIASES):
+                key = k
+                break
 
-if not key:
-    logger.warning(
-        f"EXCEL_CONF | column not found among={list(_EXCEL_HEADERS.keys())} -> fallback 0.5"
-    )
-    return 0.5
-
+        if not key:
+            logger.warning(
+                f"EXCEL_CONF | column not found among={list(_EXCEL_HEADERS.keys())} -> fallback 0.5"
+            )
+            return 0.5
 
         col = _EXCEL_HEADERS[key]
 
-# ===== SAFE ROW RESOLVE =====
-row_idx = 2
-val = ws.cell(row_idx, col).value
+        # ===== SAFE ROW RESOLVE =====
+        row_idx = 2
+        val = ws.cell(row_idx, col).value
 
-conf = float(val) if val is not None else 0.5
+        conf = float(val) if val is not None else 0.5
 
         conf = _clamp(conf, 0.0, 1.0)
 
@@ -181,9 +180,8 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
     # ✅ Excel-driven confidence (hedge-grade)
     raw_conf = _read_excel_confidence()
 
-# ===== INSTITUTIONAL MICRO BOOST =====
-confidence_score = _clamp(raw_conf * 1.08, 0.0, 1.0)
-
+    # ===== INSTITUTIONAL MICRO BOOST =====
+    confidence_score = _clamp(raw_conf * 1.08, 0.0, 1.0)
 
     # volatility proxy
     abs_rets = []
@@ -217,5 +215,3 @@ confidence_score = _clamp(raw_conf * 1.08, 0.0, 1.0)
         "last": last,
         "ma20": ma20,
     }
-
-
