@@ -1,4 +1,4 @@
-# execution/signal_generator.py (HEDGE-GRADE HARDENED)
+# execution/signal_generator.py (HEDGE-GRADE HARDENED — FIXED)
 
 import os
 import time
@@ -64,76 +64,6 @@ def _mark_emitted():
     _last_emit_ts = time.time()
 
 
-# ===================== HEDGE EXCEL READER =====================
-
-def _read_excel_confidence() -> float:
-    global _EXCEL_WB, _EXCEL_HEADERS, _EXCEL_CONF_CACHE, _EXCEL_CONF_TS
-
-    now = time.time()
-
-    # ===== CACHE HIT =====
-    if _EXCEL_CONF_CACHE is not None and (now - _EXCEL_CONF_TS) < EXCEL_CONF_REFRESH_SEC:
-        return _EXCEL_CONF_CACHE
-
-    try:
-        if not EXCEL_MODEL_PATH:
-            return 0.5
-
-        # ===== OPEN ONCE =====
-        if _EXCEL_WB is None:
-            _EXCEL_WB = openpyxl.load_workbook(EXCEL_MODEL_PATH, data_only=True)
-            ws = _EXCEL_WB["AI_MASTER_LIVE_DECISION"]
-
-            headers = {}
-            for c in range(1, ws.max_column + 1):
-                v = ws.cell(1, c).value
-                if v:
-                    headers[str(v).strip().lower()] = c
-            _EXCEL_HEADERS = headers
-
-        ws = _EXCEL_WB["AI_MASTER_LIVE_DECISION"]
-
-        # ===== HEDGE AUTO-DETECT CONF COLUMN =====
-        key = None
-
-        CONF_ALIASES = [
-            "confidence",
-            "ai confidence",
-            "ai score",
-            "score",
-        ]
-
-        for k in _EXCEL_HEADERS.keys():
-            kl = str(k).lower()
-            if any(alias in kl for alias in CONF_ALIASES):
-                key = k
-                break
-
-        if not key:
-            logger.warning(
-                f"EXCEL_CONF | column not found among={list(_EXCEL_HEADERS.keys())} -> fallback 0.5"
-            )
-            return 0.5
-
-        col = _EXCEL_HEADERS[key]
-
-        # ===== SAFE ROW RESOLVE =====
-        row_idx = 2
-        val = ws.cell(row_idx, col).value
-
-        conf = float(val) if val is not None else 0.5
-
-        conf = _clamp(conf, 0.0, 1.0)
-
-        _EXCEL_CONF_CACHE = conf
-        _EXCEL_CONF_TS = now
-        return conf
-
-    except Exception as e:
-        logger.warning(f"EXCEL_CONF | err={e} -> fallback")
-        return _EXCEL_CONF_CACHE if _EXCEL_CONF_CACHE is not None else 0.5
-
-
 # ===================== CORE =====================
 
 def _core() -> ExcelLiveCore:
@@ -141,7 +71,7 @@ def _core() -> ExcelLiveCore:
     if _CORE is None:
         if not EXCEL_MODEL_PATH:
             raise RuntimeError("EXCEL_MODEL_PATH is empty")
-        logger.info(f"EXCEL_CORE | loading workbook={EXCEL_MODEL_PATH}")
+        logger.info(f"[GEN] EXCEL_CORE_LOADED | path={EXCEL_MODEL_PATH}")
         _CORE = ExcelLiveCore(workbook_path=EXCEL_MODEL_PATH)
     return _CORE
 
@@ -177,13 +107,16 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
     if v20 > 0:
         volume_score = _clamp(vlast / v20, 0.0, 1.5) / 1.5
 
-    # ✅ Excel-driven confidence (hedge-grade)
-    raw_conf = _read_excel_confidence()
+    # ===== EXCEL CONF =====
+    raw_conf = 0.5
+    try:
+        raw_conf = _core().read_confidence()
+    except Exception:
+        pass
 
-    # ===== INSTITUTIONAL MICRO BOOST =====
     confidence_score = _clamp(raw_conf * 1.08, 0.0, 1.0)
 
-    # volatility proxy
+    # ===== VOL REGIME =====
     abs_rets = []
     for i in range(1, len(closes)):
         prev_c = closes[i - 1]
@@ -210,7 +143,6 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
         "volume_score": volume_score,
         "confidence_score": confidence_score,
         "volatility_regime": volatility_regime,
-        "volatility_ratio": vol_ratio,
         "risk_state": "OK",
         "last": last,
         "ma20": ma20,
@@ -220,67 +152,68 @@ def _fetch_snapshot(symbol: str) -> Dict[str, Any]:
 # ===================== SIGNAL GENERATION =====================
 
 def generate_signals():
-    """Main signal generation loop"""
     symbols = os.getenv("BOT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
     symbols = [s.strip() for s in symbols if s.strip()]
-
-    logger.info(f"Signal Generator | symbols={symbols}")
 
     for symbol in symbols:
         try:
             if not _cooldown_ok():
-                logger.debug(f"SIGNAL_GEN | {symbol} cooldown active")
                 continue
 
-            snapshot = _fetch_snapshot(symbol)
-            logger.info(f"SIGNAL_SNAPSHOT | {symbol} -> {snapshot}")
+            snap = _fetch_snapshot(symbol)
 
-            # Check if we should generate signal
+            core = _core()
+            decision = core.evaluate(
+                CoreInputs(
+                    trend_strength=snap["trend_strength"],
+                    structure_ok=snap["structure_ok"],
+                    volume_score=snap["volume_score"],
+                    confidence_score=snap["confidence_score"],
+                    volatility_regime=snap["volatility_regime"],
+                    risk_state=snap["risk_state"],
+                )
+            )
+
+            logger.info(
+                f"[GEN] CORE_DECISION | symbol={symbol} ai={decision.ai_score:.3f} "
+                f"macro={decision.macro_gate} strat={decision.active_strategy} "
+                f"final={decision.final_decision} risk={decision.risk_state} "
+                f"volReg={snap['volatility_regime']} last={snap['last']:.2f}"
+            )
+
             if not ALLOW_LIVE_SIGNALS:
-                logger.info(f"SIGNAL_GEN | LIVE signals disabled -> skip")
                 continue
 
-            # Check for active OCO
             if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and has_active_oco_for_symbol(symbol):
-                logger.info(f"SIGNAL_GEN | {symbol} has active OCO -> skip")
                 continue
 
-            # Generate signal if conditions met
-            if snapshot["structure_ok"] and snapshot["confidence_score"] > 0.6:
-                signal = {
-                    "id": str(uuid.uuid4()),
-                    "timestamp": _now_utc_iso(),
-                    "symbol": symbol,
-                    "direction": "LONG" if snapshot["trend_strength"] > 0.5 else "SHORT",
-                    "confidence": snapshot["confidence_score"],
-                    "quote_amount": BOT_QUOTE_PER_TRADE,
-                    "risk_state": snapshot["risk_state"],
-                    "volatility_regime": snapshot["volatility_regime"],
-                }
+            if decision.final_decision != "EXECUTE":
+                continue
 
-                logger.info(f"SIGNAL_EMIT | {signal}")
-                append_signal(signal)
-                _mark_emitted()
+            signal = {
+                "id": str(uuid.uuid4()),
+                "timestamp": _now_utc_iso(),
+                "symbol": symbol,
+                "direction": "LONG",
+                "confidence": decision.ai_score,
+                "quote_amount": BOT_QUOTE_PER_TRADE,
+                "risk_state": decision.risk_state,
+                "volatility_regime": snap["volatility_regime"],
+            }
+
+            append_signal(signal)
+            _mark_emitted()
 
         except Exception as e:
-            logger.error(f"SIGNAL_GEN | {symbol} ERROR={e}")
+            logger.error(f"[GEN] {symbol} ERROR={e}", exc_info=True)
 
 
 # ===================== MAIN =====================
 
 def main():
-    """Entry point for signal generator"""
-    logger.info(f"SIGNAL_GENERATOR | starting")
-    logger.info(f"EXCEL_MODEL_PATH={EXCEL_MODEL_PATH}")
-    logger.info(f"ALLOW_LIVE_SIGNALS={ALLOW_LIVE_SIGNALS}")
-    logger.info(f"TIMEFRAME={TIMEFRAME}")
-
+    logger.info("[GEN] Signal generator starting")
     while True:
-        try:
-            generate_signals()
-        except Exception as e:
-            logger.error(f"SIGNAL_GENERATOR main loop error={e}", exc_info=True)
-
+        generate_signals()
         time.sleep(int(os.getenv("BOT_SIGNAL_LOOP_SLEEP_SECONDS", "30")))
 
 
