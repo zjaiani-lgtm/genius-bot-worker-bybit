@@ -1,6 +1,7 @@
 import os
+import math
 import logging
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Tuple
 
 import ccxt
 
@@ -23,6 +24,28 @@ def _to_bool(v: str, default: bool = False) -> bool:
 
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+def _ceil_to_step(x: float, step: float) -> float:
+    if step is None or step <= 0:
+        return x
+    return math.ceil(x / step) * step
+
+
+def _infer_amount_step_from_precision(prec: Optional[int]) -> Optional[float]:
+    """
+    ccxt market['precision']['amount'] is typically number of decimals.
+    step = 10^-prec.
+    """
+    if prec is None:
+        return None
+    try:
+        prec_int = int(prec)
+        if prec_int < 0:
+            return None
+        return 10 ** (-prec_int)
+    except Exception:
+        return None
 
 
 class UnifiedClient:
@@ -232,28 +255,95 @@ class UnifiedClient:
     # ----------------------------
     # Orders
     # ----------------------------
+    def _bybit_min_constraints(self, symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """
+        Returns: (min_base_amount, min_cost, amount_step)
+        All may be None if exchange doesn't expose.
+        """
+        try:
+            m = self.exchange.market(symbol)
+            limits = m.get("limits") or {}
+            amt_min = ((limits.get("amount") or {}).get("min"))
+            cost_min = ((limits.get("cost") or {}).get("min"))
+            prec_amt = (m.get("precision") or {}).get("amount")
+            step = _infer_amount_step_from_precision(prec_amt)
+
+            min_base = float(amt_min) if amt_min is not None else None
+            min_cost = float(cost_min) if cost_min is not None else None
+            return min_base, min_cost, step
+        except Exception:
+            return None, None, None
+
     def place_market_buy_by_quote(self, symbol: str, quote_amount: float) -> Dict[str, Any]:
         """
         Binance spot: uses quoteOrderQty (best)
         Bybit: calculates base qty = quote_amount / last_price
+        Adds: min amount / min cost checks (prevents "precision 0.001" failures)
         """
         self._guard(symbol, quote_amount=quote_amount)
+
         try:
+            # Ensure markets are loaded for limits/precision
+            try:
+                if not getattr(self.exchange, "markets", None):
+                    self.exchange.load_markets()
+            except Exception:
+                pass
+
             if self.exchange_name == "binance":
                 params = {"quoteOrderQty": float(quote_amount)}
                 return self.exchange.create_order(symbol, "market", "buy", None, None, params)
 
+            # ---- BYBIT sizing ----
             last = self.fetch_last_price(symbol)
             if last <= 0:
                 raise ExchangeClientError("Invalid last price for sizing.")
 
-            base_amount = float(quote_amount) / float(last)
-            base_amount = self.floor_amount(symbol, base_amount)
+            min_base, min_cost, step = self._bybit_min_constraints(symbol)
 
-            if base_amount <= 0:
-                raise ExchangeClientError("Computed base amount <= 0 after precision flooring.")
+            base_raw = float(quote_amount) / float(last)
 
-            return self.exchange.create_order(symbol, "market", "buy", float(base_amount), None, {})
+            # If exchange exposes min_cost, enforce it first
+            if min_cost is not None:
+                # add tiny buffer for price movement
+                if float(quote_amount) < float(min_cost) * 1.01:
+                    raise ExchangeClientError(
+                        f"BUY_BLOCKED_MIN_COST | symbol={symbol} need_quote>={float(min_cost):.4f} "
+                        f"have={float(quote_amount):.4f}"
+                    )
+
+            # If exchange exposes min_base, ensure quote can reach it
+            if min_base is not None:
+                need_quote_for_min = float(min_base) * float(last) * 1.02
+                if float(quote_amount) < need_quote_for_min:
+                    raise ExchangeClientError(
+                        f"BUY_BLOCKED_MIN_AMOUNT | symbol={symbol} min_base={float(min_base):.6f} "
+                        f"last={float(last):.2f} need_quote>={need_quote_for_min:.2f} have={float(quote_amount):.2f}"
+                    )
+                base_raw = max(base_raw, float(min_base))
+
+            # Floor to precision (may round DOWN)
+            base_amt = self.floor_amount(symbol, base_raw)
+
+            # If rounding down made it smaller than min_base, bump UP to step or min_base
+            if min_base is not None and float(base_amt) < float(min_base):
+                if step is not None:
+                    base_amt = _ceil_to_step(float(base_amt), float(step))
+                base_amt = max(float(base_amt), float(min_base))
+                # after bump, re-apply precision formatting
+                base_amt = float(self.exchange.amount_to_precision(symbol, base_amt))
+
+            if base_amt <= 0:
+                raise ExchangeClientError("Computed base amount <= 0 after precision.")
+
+            # Debug log helpful in live
+            logger.info(
+                f"BUY_SIZE_DEBUG | exchange=bybit symbol={symbol} quote={float(quote_amount):.4f} "
+                f"last={float(last):.2f} base_raw={base_raw:.8f} base_final={float(base_amt):.8f} "
+                f"min_base={min_base} min_cost={min_cost} step={step}"
+            )
+
+            return self.exchange.create_order(symbol, "market", "buy", float(base_amt), None, {})
 
         except LiveTradingBlocked:
             raise
