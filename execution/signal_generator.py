@@ -394,11 +394,17 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         struct_soft_ok = False
         struct_soft_reason = ""
         if not struct_ok:
-            struct_soft_ok, struct_soft_reason = _structure_ok_soft(closes, last, ma20, trend)
-            if struct_soft_ok:
-                struct_ok = True
-                if GEN_DEBUG:
-                    logger.info(f"[GEN] STRUCT_OVERRIDE | symbol={symbol} applied=True reason={struct_soft_reason}")
+    struct_soft_ok, struct_soft_reason = _structure_ok_soft(closes, last, ma20, trend)
+
+    if struct_soft_ok:
+        struct_ok = True
+        if GEN_DEBUG:
+            logger.info(
+                f"[GEN] STRUCT_OVERRIDE | symbol={symbol} applied=True reason={struct_soft_reason}"
+            )
+    else:
+        logger.info(f"[GEN] STRUCT_FAIL | symbol={symbol}")  # 🔥 კრიტიკული
+        continue  # 🔥 კრიტიკული
 
         vol_score = _volume_score(vols)
         conf = _confidence_score(closes, ohlcv)
@@ -530,5 +536,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
 def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     return generate_signal()
+
 
 
