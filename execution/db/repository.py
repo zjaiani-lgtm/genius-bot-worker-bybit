@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import List, Optional, Iterable, Tuple
+from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 from execution.db.db import get_connection
 
@@ -23,7 +23,7 @@ def get_system_state():
     if row is None:
         return None
     try:
-        return tuple(row)   # ✅ important: makes bootstrap + autoscaler health_ok work
+        return tuple(row)  # important: makes bootstrap/state parsing consistent
     except Exception:
         return row
 
@@ -36,7 +36,11 @@ def update_system_state(status: str = None, startup_sync_ok: int = None, kill_sw
     row = cur.fetchone()
 
     if not row:
-        cur.execute("INSERT INTO system_state (id, status, startup_sync_ok, kill_switch, updated_at_utc) VALUES (1, 'RUNNING', 1, 0, ?)", (_utc_now_iso(),))
+        cur.execute(
+            "INSERT INTO system_state (id, status, startup_sync_ok, kill_switch, updated_at_utc) "
+            "VALUES (1, 'RUNNING', 1, 0, ?)",
+            (_utc_now_iso(),),
+        )
         conn.commit()
         conn.close()
         return
@@ -68,7 +72,6 @@ def log_event(event_type: str, details: str = ""):
 
 
 def count_recent_risk_events(event_types: Iterable[str], window_minutes: int = 60) -> int:
-    # treat these as "risk alerts"
     since = datetime.utcnow() - timedelta(minutes=int(window_minutes))
     since_iso = since.isoformat() + "Z"
 
@@ -90,7 +93,7 @@ def count_recent_risk_events(event_types: Iterable[str], window_minutes: int = 6
     )
     row = cur.fetchone()
     conn.close()
-    return int(row[0] or 0)
+    return int((row[0] if row else 0) or 0)
 
 
 # -------------------------
@@ -108,48 +111,118 @@ def signal_id_already_executed(signal_id: str, action: str = "EXECUTE") -> bool:
     return row is not None
 
 
-def mark_signal_id_executed(signal_id: str, action: str = "EXECUTE", symbol: str = None):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO executed_signals (signal_id, action, symbol, created_at_utc) VALUES (?, ?, ?, ?)",
-        (str(signal_id), str(action), str(symbol) if symbol else None, _utc_now_iso()),
-    )
-    conn.commit()
-    conn.close()
-
-
-# -------------------------
-# oco links
-# -------------------------
-def create_oco_link(link_id: str, symbol: str, tp_order_id: str, sl_order_id: str):
+def mark_signal_id_executed(
+    signal_id: str,
+    signal_hash: str = None,
+    action: str = "EXECUTE",
+    symbol: str = None,
+):
+    """
+    Engine calls: mark_signal_id_executed(signal_id, signal_hash=..., action=..., symbol=...)
+    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO oco_links (link_id, symbol, tp_order_id, sl_order_id, status, created_at_utc)
-        VALUES (?, ?, ?, ?, 'open', ?)
+        INSERT OR IGNORE INTO executed_signals (signal_id, signal_hash, action, symbol, created_at_utc)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (str(link_id), str(symbol), str(tp_order_id), str(sl_order_id), _utc_now_iso()),
+        (
+            str(signal_id),
+            str(signal_hash) if signal_hash else None,
+            str(action),
+            str(symbol) if symbol else None,
+            _utc_now_iso(),
+        ),
     )
     conn.commit()
     conn.close()
 
 
-def set_oco_status(link_id: str, status: str):
+# -------------------------
+# oco links (engine-compatible)
+# -------------------------
+def create_oco_link(
+    signal_id: str,
+    symbol: str,
+    base_asset: str = None,
+    tp_order_id: str = None,
+    sl_order_id: str = None,
+    tp_price: float = None,
+    sl_stop_price: float = None,
+    sl_limit_price: float = None,
+    amount: float = None,
+):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE oco_links SET status=? WHERE link_id=?", (str(status), str(link_id)))
+    cur.execute(
+        """
+        INSERT INTO oco_links
+        (link_id, signal_id, symbol, base_asset, tp_order_id, sl_order_id,
+         tp_price, sl_stop_price, sl_limit_price, amount, status, created_at_utc, updated_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+        """,
+        (
+            str(signal_id),  # legacy
+            str(signal_id),  # engine
+            str(symbol),
+            str(base_asset) if base_asset else None,
+            str(tp_order_id or ""),
+            str(sl_order_id or ""),
+            float(tp_price) if tp_price is not None else None,
+            float(sl_stop_price) if sl_stop_price is not None else None,
+            float(sl_limit_price) if sl_limit_price is not None else None,
+            float(amount) if amount is not None else None,
+            _utc_now_iso(),
+            _utc_now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_oco_status(link_id: int, status: str):
+    """
+    Engine passes link_id as integer primary key (the first column returned from list_active_oco_links).
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE oco_links SET status=?, updated_at_utc=? WHERE id=?",
+        (str(status), _utc_now_iso(), int(link_id)),
+    )
     conn.commit()
     conn.close()
 
 
 def list_active_oco_links(limit: int = 50) -> List[Tuple]:
+    """
+    Must return tuples in this exact order for engine unpack:
+    (
+      id, signal_id, symbol, base_asset,
+      tp_order_id, sl_order_id,
+      tp_price, sl_stop_price, sl_limit_price,
+      amount, status, created_at_utc, updated_at_utc
+    )
+    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, link_id, symbol, tp_order_id, sl_order_id, status, created_at_utc
+        SELECT
+            id,
+            signal_id,
+            symbol,
+            base_asset,
+            tp_order_id,
+            sl_order_id,
+            tp_price,
+            sl_stop_price,
+            sl_limit_price,
+            amount,
+            status,
+            created_at_utc,
+            updated_at_utc
         FROM oco_links
         WHERE status='open'
         ORDER BY id DESC
@@ -160,15 +233,13 @@ def list_active_oco_links(limit: int = 50) -> List[Tuple]:
     rows = cur.fetchall()
     conn.close()
 
-    # sqlite3.Row -> tuple conversion for consistent unpacking elsewhere
-    out = []
+    out: List[Tuple] = []
     for r in rows or []:
         try:
             out.append(tuple(r))
         except Exception:
             out.append(r)
     return out
-
 
 
 def has_active_oco_for_symbol(symbol: str) -> bool:
@@ -184,7 +255,7 @@ def has_active_oco_for_symbol(symbol: str) -> bool:
 
 
 # -------------------------
-# trade_history (Auto-Scaler metrics)
+# trade_history (core)
 # -------------------------
 def create_trade_open(
     signal_id: str,
@@ -216,73 +287,16 @@ def create_trade_open(
     conn.close()
 
 
-def get_open_trade_by_signal(signal_id: str):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, signal_id, symbol, quote_amount, base_amount, entry_price, entry_order_id, opened_at, status
-        FROM trade_history
-        WHERE status='OPEN' AND signal_id=?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (str(signal_id),),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def get_latest_open_trade_for_symbol(symbol: str):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT id, signal_id, symbol, quote_amount, base_amount, entry_price, entry_order_id, opened_at, status
-        FROM trade_history
-        WHERE status='OPEN' AND symbol=?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (str(symbol),),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def close_trade(
+def _close_trade_by_id(
     trade_id: int,
     exit_price: float,
     close_reason: str,
+    pnl_quote: float = 0.0,
+    pnl_pct: float = 0.0,
     exit_order_id: str = None,
 ):
     conn = get_connection()
     cur = conn.cursor()
-
-    # fetch entry
-    cur.execute(
-        """
-        SELECT id, quote_amount, entry_price
-        FROM trade_history
-        WHERE id=?
-        """,
-        (int(trade_id),),
-    )
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return
-
-    quote_amount = float(row[1] or 0.0)
-    entry_price = float(row[2] or 0.0)
-    exit_price = float(exit_price)
-
-    # approx pnl
-    pnl_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0.0
-    pnl_quote = quote_amount * pnl_pct
-
     cur.execute(
         """
         UPDATE trade_history
@@ -309,6 +323,94 @@ def close_trade(
     conn.close()
 
 
+# -------------------------
+# trade_history (engine-compatible API)
+# -------------------------
+def open_trade(signal_id: str, symbol: str, qty: float, quote_in: float, entry_price: float):
+    """
+    Engine calls: open_trade(signal_id=..., symbol=..., qty=..., quote_in=..., entry_price=...)
+    We store qty in base_amount and quote_in in quote_amount.
+    """
+    create_trade_open(
+        signal_id=str(signal_id),
+        symbol=str(symbol),
+        quote_amount=float(quote_in),
+        entry_price=float(entry_price),
+        base_amount=float(qty),
+        entry_order_id=None,
+    )
+
+
+def get_trade(signal_id: str):
+    """
+    Engine expects tuple:
+    (signal_id, symbol, qty, quote_in, entry_price, opened_at, exit_price, closed_at, outcome, pnl_quote, pnl_pct)
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            signal_id,
+            symbol,
+            base_amount AS qty,
+            quote_amount AS quote_in,
+            entry_price,
+            opened_at,
+            exit_price,
+            closed_at,
+            close_reason AS outcome,
+            pnl_quote,
+            pnl_pct
+        FROM trade_history
+        WHERE signal_id=?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (str(signal_id),),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        return tuple(row)
+    except Exception:
+        return row
+
+
+def close_trade(signal_id: str, exit_price: float, outcome: str, pnl_quote: float = 0.0, pnl_pct: float = 0.0):
+    """
+    Engine calls: close_trade(signal_id, exit_price=..., outcome="TP/SL", pnl_quote=..., pnl_pct=...)
+    We close the latest OPEN trade row for that signal_id.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id
+        FROM trade_history
+        WHERE signal_id=? AND status='OPEN'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (str(signal_id),),
+    )
+    r = cur.fetchone()
+    conn.close()
+    if not r:
+        return
+
+    trade_id = int(r[0])
+    _close_trade_by_id(
+        trade_id=trade_id,
+        exit_price=float(exit_price),
+        close_reason=str(outcome),
+        pnl_quote=float(pnl_quote),
+        pnl_pct=float(pnl_pct),
+    )
+
+
 def list_recent_closed_trades(limit: int = 20) -> List[Tuple]:
     conn = get_connection()
     cur = conn.cursor()
@@ -327,14 +429,13 @@ def list_recent_closed_trades(limit: int = 20) -> List[Tuple]:
     conn.close()
     return rows or []
 
-def get_trade_stats() -> dict:
+
+def get_trade_stats() -> Dict[str, Any]:
     """
-    Returns simple performance stats computed from trade_history CLOSED rows.
-    Safe even when there are 0 closed trades.
+    Used by execution/main.py PERF_REPORT
     """
     conn = get_connection()
     cur = conn.cursor()
-
     cur.execute(
         """
         SELECT
@@ -349,7 +450,6 @@ def get_trade_stats() -> dict:
         WHERE status='CLOSED'
         """
     )
-
     row = cur.fetchone()
     conn.close()
 
@@ -375,5 +475,3 @@ def get_trade_stats() -> dict:
         "quote_in_sum": quote_sum,
         "profit_factor": profit_factor,
     }
-
-
