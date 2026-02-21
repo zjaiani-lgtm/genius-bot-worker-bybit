@@ -1,4 +1,3 @@
-# execution/excel_live_core.py
 from __future__ import annotations
 
 import os
@@ -9,8 +8,12 @@ from typing import Any, Dict, Tuple, Optional
 import openpyxl
 
 
-CORE_VERSION = "2026-02-20.soft-volume-override.v1"
+CORE_VERSION = "2026-02-21.topuria-prime.wiring.v2"
 
+
+# ============================================================
+# UTILS
+# ============================================================
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
@@ -25,11 +28,11 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _norm_key(v: Any) -> str:
+    return str(v).strip().upper()
+
+
 def _parse_threshold_cell(s: Any) -> Optional[float]:
-    """
-    Accepts values like '≥0.60', '>=0.64', '0.50', etc.
-    Returns float or None if not numeric.
-    """
     if s is None:
         return None
     if isinstance(s, (int, float)):
@@ -55,46 +58,52 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+# ============================================================
+# INPUT STRUCT
+# ============================================================
+
 @dataclass
 class CoreInputs:
-    trend_strength: float          # 0..1
-    structure_ok: bool             # True/False
-    volume_score: float            # 0..1
-    risk_state: str                # OK / REDUCE / KILL
-    confidence_score: float        # 0..1
-    volatility_regime: str         # LOW / NORMAL / EXTREME
-    # optional macro flags (can be fed later)
-    liquidity_regime: str = "EXPANSION"        # EXPANSION / CONTRACTION
-    macro_risk_level: str = "LOW_RISK"         # LOW_RISK / HIGH_RISK
-    shock_absorber: str = "NORMAL"             # NORMAL / REDUCE_EXPOSURE
+    trend_strength: float
+    structure_ok: bool
+    volume_score: float
+    risk_state: str
+    confidence_score: float
+    volatility_regime: str
+    liquidity_regime: str = "EXPANSION"
+    macro_risk_level: str = "LOW_RISK"
+    shock_absorber: str = "NORMAL"
 
+
+# ============================================================
+# MAIN CORE
+# ============================================================
 
 class ExcelLiveCore:
-    """
-    Live Core evaluator based on workbook:
-    - WEIGHT_THRESHOLD_MATRIX (weights + thresholds)
-
-    FIX:
-      If volume confirmation blocks too often (common on 15m),
-      allow a SOFT override when AI score is very strong AND other gates pass.
-
-      Default:
-        vol_th = 0.50 (from Excel)
-        soft relax = 0.10  => allow 0.40 when ai >= 0.75 and other gates ok
-    """
 
     def __init__(self, workbook_path: str):
         if not os.path.exists(workbook_path):
             raise FileNotFoundError(f"EXCEL_MODEL_NOT_FOUND: {workbook_path}")
 
         self.wb = openpyxl.load_workbook(workbook_path, data_only=False)
+
+        # ORIGINAL
         self.weights, self.thresholds = self._load_weight_threshold_matrix()
 
-        # Soft override knobs (ENV)
+        # NEW — SAFE LOADERS
+        self.capital_modes = self._load_capital_preservation()
+        self.slippage_table = self._load_slippage_control()
+        self.volatility_table = self._load_volatility_regime()
+
+        # Soft override knobs
         self.enable_soft_volume_override = _env_bool("ENABLE_SOFT_VOLUME_OVERRIDE", True)
         self.soft_volume_ai_min = _env_float("SOFT_VOLUME_AI_MIN", 0.75)
         self.soft_volume_relax = _env_float("SOFT_VOLUME_RELAX", 0.10)
         self.soft_volume_require_volband = _env_bool("SOFT_VOLUME_REQUIRE_VOLBAND", True)
+
+    # ============================================================
+    # LOADERS
+    # ============================================================
 
     def _load_weight_threshold_matrix(self) -> Tuple[Dict[str, float], Dict[str, Any]]:
         ws = self.wb["WEIGHT_THRESHOLD_MATRIX"]
@@ -116,6 +125,52 @@ class ExcelLiveCore:
 
         return weights, thresholds
 
+    def _load_capital_preservation(self) -> Dict[str, float]:
+        try:
+            ws = self.wb["CAPITAL_PRESERVATION_MODE"]
+        except KeyError:
+            return {}
+
+        out: Dict[str, float] = {}
+        for r in range(2, ws.max_row + 1):
+            mode = ws.cell(r, 1).value
+            val = ws.cell(r, 2).value
+            if mode:
+                out[_norm_key(mode)] = _safe_float(val, 1.0)
+        return out
+
+    def _load_slippage_control(self) -> Dict[str, float]:
+        try:
+            ws = self.wb["SLIPPAGE_CONTROL"]
+        except KeyError:
+            return {}
+
+        out: Dict[str, float] = {}
+        for r in range(2, ws.max_row + 1):
+            reg = ws.cell(r, 1).value
+            val = ws.cell(r, 2).value
+            if reg:
+                out[_norm_key(reg)] = _safe_float(val, 0.15)
+        return out
+
+    def _load_volatility_regime(self) -> Dict[str, float]:
+        try:
+            ws = self.wb["VOLATILITY_REGIME"]
+        except KeyError:
+            return {}
+
+        out: Dict[str, float] = {}
+        for r in range(2, ws.max_row + 1):
+            reg = ws.cell(r, 1).value
+            val = ws.cell(r, 2).value
+            if reg:
+                out[_norm_key(reg)] = _safe_float(val, 0.25)
+        return out
+
+    # ============================================================
+    # LOGIC
+    # ============================================================
+
     def _macro_gate(self, inp: CoreInputs) -> str:
         if inp.liquidity_regime == "CONTRACTION":
             return "BLOCK"
@@ -126,7 +181,7 @@ class ExcelLiveCore:
         return "ALLOW"
 
     def _vol_allowed(self, regime: str) -> bool:
-        return regime in ("LOW", "NORMAL")
+        return _norm_key(regime) in ("LOW", "NORMAL")
 
     def _score(self, inp: CoreInputs) -> float:
         w = self.weights
@@ -152,6 +207,10 @@ class ExcelLiveCore:
         )
         return _clamp(total, 0.0, 1.0)
 
+    # ============================================================
+    # DECISION
+    # ============================================================
+
     def decide(self, inp: CoreInputs) -> Dict[str, Any]:
         ai_score = self._score(inp)
         macro_gate = self._macro_gate(inp)
@@ -166,10 +225,8 @@ class ExcelLiveCore:
         risk_ok = inp.risk_state != "KILL"
         volband_ok = self._vol_allowed(inp.volatility_regime)
 
-        # strict volume
         vol_ok_strict = inp.volume_score >= float(vol_th)
 
-        # soft volume override
         soft_vol_th = _clamp(float(vol_th) - float(self.soft_volume_relax), 0.0, 1.0)
         vol_ok_soft = False
 
@@ -191,33 +248,14 @@ class ExcelLiveCore:
             "final_trade_decision": final_trade_decision,
             "reasons": {
                 "core_version": CORE_VERSION,
-
                 "trend_strength": inp.trend_strength,
-                "trend_th": float(trend_th),
                 "trend_ok": trend_ok,
-
-                "structure_ok": struct_ok,
-
-                "volume_score": inp.volume_score,
-                "volume_th": float(vol_th),
-                "volume_th_soft": float(soft_vol_th),
-                "volume_ok_strict": vol_ok_strict,
-                "volume_ok_soft": vol_ok_soft,
                 "volume_ok": vol_ok,
-
-                "confidence_score": inp.confidence_score,
-                "conf_th": float(conf_th),
                 "confidence_ok": conf_ok,
-
-                "risk_state": inp.risk_state,
                 "risk_ok": risk_ok,
-
-                "volatility_regime": inp.volatility_regime,
                 "volband_ok": volband_ok,
-
-                "soft_volume_override_enabled": bool(self.enable_soft_volume_override),
-                "soft_volume_ai_min": float(self.soft_volume_ai_min),
-                "soft_volume_relax": float(self.soft_volume_relax),
-                "soft_volume_require_volband": bool(self.soft_volume_require_volband),
+                "capital_modes_loaded": bool(self.capital_modes),
+                "slippage_table_loaded": bool(self.slippage_table),
+                "volatility_table_loaded": bool(self.volatility_table),
             },
         }
