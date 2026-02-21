@@ -327,3 +327,53 @@ def list_recent_closed_trades(limit: int = 20) -> List[Tuple]:
     conn.close()
     return rows or []
 
+def get_trade_stats() -> dict:
+    """
+    Returns simple performance stats computed from trade_history CLOSED rows.
+    Safe even when there are 0 closed trades.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            COUNT(1) AS closed_trades,
+            SUM(CASE WHEN COALESCE(pnl_quote, 0) > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN COALESCE(pnl_quote, 0) <= 0 THEN 1 ELSE 0 END) AS losses,
+            SUM(COALESCE(pnl_quote, 0)) AS pnl_quote_sum,
+            SUM(COALESCE(quote_amount, 0)) AS quote_in_sum,
+            SUM(CASE WHEN COALESCE(pnl_quote, 0) > 0 THEN COALESCE(pnl_quote, 0) ELSE 0 END) AS gross_profit,
+            ABS(SUM(CASE WHEN COALESCE(pnl_quote, 0) < 0 THEN COALESCE(pnl_quote, 0) ELSE 0 END)) AS gross_loss
+        FROM trade_history
+        WHERE status='CLOSED'
+        """
+    )
+
+    row = cur.fetchone()
+    conn.close()
+
+    closed = int((row["closed_trades"] if row else 0) or 0)
+    wins = int((row["wins"] if row else 0) or 0)
+    losses = int((row["losses"] if row else 0) or 0)
+    pnl_sum = float((row["pnl_quote_sum"] if row else 0.0) or 0.0)
+    quote_sum = float((row["quote_in_sum"] if row else 0.0) or 0.0)
+    gross_profit = float((row["gross_profit"] if row else 0.0) or 0.0)
+    gross_loss = float((row["gross_loss"] if row else 0.0) or 0.0)
+
+    winrate = (wins / closed * 100.0) if closed > 0 else 0.0
+    roi = (pnl_sum / quote_sum * 100.0) if quote_sum > 0 else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+
+    return {
+        "closed_trades": closed,
+        "wins": wins,
+        "losses": losses,
+        "winrate_pct": winrate,
+        "roi_pct": roi,
+        "pnl_quote_sum": pnl_sum,
+        "quote_in_sum": quote_sum,
+        "profit_factor": profit_factor,
+    }
+
+
