@@ -48,7 +48,7 @@ def init_db() -> None:
     """)
 
     # -------------------------
-    # executed_signals (idempotency)  ✅ now supports signal_hash
+    # executed_signals
     # -------------------------
     cur.execute("""
     CREATE TABLE IF NOT EXISTS executed_signals (
@@ -60,43 +60,36 @@ def init_db() -> None:
         created_at_utc TEXT NOT NULL
     )
     """)
+
+    # MIGRATION: add signal_hash if old table existed
+    cur.execute("PRAGMA table_info(executed_signals)")
+    ex_cols = {r[1] for r in (cur.fetchall() or [])}
+    if "signal_hash" not in ex_cols:
+        cur.execute("ALTER TABLE executed_signals ADD COLUMN signal_hash TEXT")
+
+    # unique index (safe)
     cur.execute("""
     CREATE UNIQUE INDEX IF NOT EXISTS ux_executed_signals_signal_id_action
     ON executed_signals(signal_id, action)
     """)
 
-    # MIGRATION: add signal_hash if old table existed
-    cur.execute("PRAGMA table_info(executed_signals)")
-    cols = {r[1] for r in (cur.fetchall() or [])}
-    if "signal_hash" not in cols:
-        cur.execute("ALTER TABLE executed_signals ADD COLUMN signal_hash TEXT")
-
     # -------------------------
-    # oco_links  ✅ engine-compatible schema + migrations
+    # oco_links (create table first, then migrate columns, then indexes)
     # -------------------------
+    # IMPORTANT: keep this minimal to not break old table creation
     cur.execute("""
     CREATE TABLE IF NOT EXISTS oco_links (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        link_id TEXT,              -- legacy (we also set it = signal_id)
-        signal_id TEXT,            -- ✅ engine uses this
+        link_id TEXT,
         symbol TEXT NOT NULL,
-        base_asset TEXT,
         tp_order_id TEXT NOT NULL,
         sl_order_id TEXT NOT NULL,
-        tp_price REAL,
-        sl_stop_price REAL,
-        sl_limit_price REAL,
-        amount REAL,
         status TEXT NOT NULL DEFAULT 'open',
-        created_at_utc TEXT NOT NULL,
-        updated_at_utc TEXT
+        created_at_utc TEXT NOT NULL
     )
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS ix_oco_links_status ON oco_links(status)")
-    cur.execute("CREATE INDEX IF NOT EXISTS ix_oco_links_symbol ON oco_links(symbol)")
-    cur.execute("CREATE INDEX IF NOT EXISTS ix_oco_links_signal_id ON oco_links(signal_id)")
 
-    # MIGRATION: add missing columns if old oco_links existed
+    # MIGRATION: add missing columns to old oco_links BEFORE creating indexes that reference them
     cur.execute("PRAGMA table_info(oco_links)")
     oco_cols = {r[1] for r in (cur.fetchall() or [])}
 
@@ -104,7 +97,6 @@ def init_db() -> None:
         if name not in oco_cols:
             cur.execute(f"ALTER TABLE oco_links ADD COLUMN {ddl}")
 
-    _add_col("link_id", "link_id TEXT")
     _add_col("signal_id", "signal_id TEXT")
     _add_col("base_asset", "base_asset TEXT")
     _add_col("tp_price", "tp_price REAL")
@@ -113,11 +105,21 @@ def init_db() -> None:
     _add_col("amount", "amount REAL")
     _add_col("updated_at_utc", "updated_at_utc TEXT")
 
+    # refresh columns after migration (optional but clearer)
+    cur.execute("PRAGMA table_info(oco_links)")
+    oco_cols2 = {r[1] for r in (cur.fetchall() or [])}
+
+    # Now it is safe to create indexes referencing migrated columns
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_oco_links_status ON oco_links(status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_oco_links_symbol ON oco_links(symbol)")
+    if "signal_id" in oco_cols2:
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_oco_links_signal_id ON oco_links(signal_id)")
+
     # backfill signal_id from legacy link_id if needed
     cur.execute("UPDATE oco_links SET signal_id = COALESCE(signal_id, link_id) WHERE signal_id IS NULL")
 
     # -------------------------
-    # trade_history ✅ used for performance stats + close by OCO
+    # trade_history
     # -------------------------
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trade_history (
