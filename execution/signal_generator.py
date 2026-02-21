@@ -217,7 +217,7 @@ base_factor = ATR_TO_TP_SANITY_FACTOR
 # --- volatility multiplier (regime-aware)
 if atr_pct < 0.25:
     vol_mult = 0.80
-elif atr_pct > 0.40:
+elif atr_pct >= 0.40:
     vol_mult = 1.15
 else:
     vol_mult = 1.00
@@ -530,4 +530,5 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
 def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     return generate_signal()
+
 
