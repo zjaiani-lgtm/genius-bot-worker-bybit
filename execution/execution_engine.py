@@ -1,234 +1,181 @@
-# execution/execution_engine.py
+# execution/exchange_client.py
 from __future__ import annotations
 
-import logging
 import os
+import time
+import logging
+from dataclasses import dataclass
 from typing import Any, Dict
 
-from execution.exchange_client import build_exchange_client
-from execution.db.repository import (
-    signal_id_already_executed,
-    mark_signal_id_executed,
-    create_oco_link,
-    list_active_oco_links,
-    set_oco_status,
-    has_active_oco_for_symbol,
-    open_trade,
-    close_trade,
-)
+import ccxt
 
 logger = logging.getLogger("gbm")
 
 
-class ExecutionEngine:
-    """
-    Minimal ExecutionEngine that matches your worker/main loop expectations:
-      - execute_signal(sig: dict)
-      - reconcile_oco()
-    """
+@dataclass
+class OrderResult:
+    order_id: str
+    raw: Dict[str, Any]
 
-    def __init__(self):
-        self.mode = os.getenv("MODE", "DEMO").upper()
-        self.exchange = build_exchange_client()
 
-    # ------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------
-    def execute_signal(self, sig: Dict[str, Any]) -> None:
-        signal_id = str(sig.get("signal_id") or sig.get("id") or "")
-        symbol = str(sig.get("symbol") or "")
-        verdict = str(sig.get("final_verdict") or sig.get("verdict") or "").upper()
+class ExchangeClient:
+    def __init__(self, ccxt_exchange: Any, market_type: str):
+        self.ex = ccxt_exchange
+        self.market_type = (market_type or "spot").lower()
 
-        if not signal_id or not symbol:
-            logger.warning(f"SIGNAL_INVALID | signal_id={signal_id} symbol={symbol}")
-            return
-
-        # idempotency
-        if signal_id_already_executed(signal_id, action="EXECUTE"):
-            logger.info(f"DEDUPED | signal_id={signal_id} action=EXECUTE")
-            return
-
-        # simple safety: avoid double OCO per symbol
-        if has_active_oco_for_symbol(symbol):
-            logger.info(f"SKIP | active OCO exists | symbol={symbol}")
-            return
-
-        if verdict not in ("BUY", "SELL"):
-            logger.info(f"SKIP | verdict={verdict} | signal_id={signal_id}")
-            mark_signal_id_executed(
-                signal_id,
-                signal_hash=str(sig.get("signal_hash") or ""),
-                action="SKIP",
-                symbol=symbol,
-            )
-            return
-
-        if verdict == "SELL":
-            logger.info(f"SKIP_SELL_SIGNAL | signal_id={signal_id} (not implemented)")
-            mark_signal_id_executed(
-                signal_id,
-                signal_hash=str(sig.get("signal_hash") or ""),
-                action="SKIP_SELL",
-                symbol=symbol,
-            )
-            return
-
-        quote_amount = float(sig.get("quote_amount") or sig.get("quote_in") or 0.0)
-        if quote_amount <= 0:
-            quote_amount = float(os.getenv("BOT_QUOTE_PER_TRADE", "7"))
-
-        # 1) Market BUY
-        logger.info(f"EXECUTE_BUY | signal_id={signal_id} symbol={symbol} quote={quote_amount}")
-        buy = self.exchange.create_market_buy(symbol, quote_amount)
-
-        # infer entry price
-        entry_price = None
+    def _exchange_id(self) -> str:
         try:
-            entry_price = float(buy.raw.get("average") or buy.raw.get("price") or 0.0) or None
+            return str(getattr(self.ex, "id", "") or "")
         except Exception:
-            entry_price = None
+            return ""
 
-        if entry_price is None:
+    def _is_bybit(self) -> bool:
+        return self._exchange_id() == "bybit"
+
+    def _is_binance(self) -> bool:
+        return self._exchange_id() == "binance"
+
+    def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
+        return self.ex.fetch_ticker(symbol)
+
+    def fetch_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        return self.ex.fetch_order(order_id, symbol)
+
+    def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
+        return self.ex.cancel_order(order_id, symbol)
+
+    def create_market_buy(self, symbol: str, quote_amount: float) -> OrderResult:
+        symbol = str(symbol)
+        quote_amount = float(quote_amount)
+
+        # Try quote-based market buy (Binance Spot)
+        params = {}
+        if self._is_binance() and self.market_type == "spot":
+            params["quoteOrderQty"] = quote_amount
+
+        if params:
             try:
-                t = self.exchange.fetch_ticker(symbol)
-                entry_price = float(t.get("last") or 0.0) or 0.0
-            except Exception:
-                entry_price = 0.0
+                o = self.ex.create_order(symbol, "market", "buy", None, None, params)
+                return OrderResult(order_id=str(o.get("id")), raw=o)
+            except Exception as e:
+                logger.warning(f"MARKET_BUY_QUOTE_PARAM_FAIL | symbol={symbol} quote={quote_amount} err={e}")
 
-        # infer qty
-        qty = None
+        # Fallback: estimate base amount using last price
+        t = self.ex.fetch_ticker(symbol)
+        last = float(t.get("last") or 0.0)
+        if last <= 0:
+            raise RuntimeError(f"Cannot estimate base amount for market buy: last price missing | symbol={symbol}")
+
+        base_amount = quote_amount / last
         try:
-            qty = float(buy.raw.get("filled") or buy.raw.get("amount") or 0.0) or None
+            if hasattr(self.ex, "amount_to_precision"):
+                base_amount = float(self.ex.amount_to_precision(symbol, base_amount))
         except Exception:
-            qty = None
+            pass
 
-        if qty is None or qty <= 0:
-            qty = (quote_amount / entry_price) if entry_price and entry_price > 0 else 0.0
+        o = self.ex.create_order(symbol, "market", "buy", base_amount, None, {})
+        return OrderResult(order_id=str(o.get("id")), raw=o)
 
-        # 2) Store trade open
-        open_trade(
-            signal_id=signal_id,
-            symbol=symbol,
-            qty=float(qty),
-            quote_in=float(quote_amount),
-            entry_price=float(entry_price or 0.0),
-        )
+    def create_limit_sell(self, symbol: str, amount: float, price: float) -> OrderResult:
+        symbol = str(symbol)
+        amount = float(amount)
+        price = float(price)
 
-        # 3) Create OCO (TP + SL)
-        tp_price = sig.get("tp_price")
-        sl_stop_price = sig.get("sl_stop_price")
-        sl_limit_price = sig.get("sl_limit_price")
+        try:
+            if hasattr(self.ex, "amount_to_precision"):
+                amount = float(self.ex.amount_to_precision(symbol, amount))
+            if hasattr(self.ex, "price_to_precision"):
+                price = float(self.ex.price_to_precision(symbol, price))
+        except Exception:
+            pass
 
-        if tp_price is None or sl_stop_price is None:
-            logger.warning(f"OCO_SKIP | missing tp/sl prices | signal_id={signal_id}")
-            mark_signal_id_executed(
-                signal_id,
-                signal_hash=str(sig.get("signal_hash") or ""),
-                action="EXECUTE",
-                symbol=symbol,
-            )
-            return
+        o = self.ex.create_order(symbol, "limit", "sell", amount, price, {})
+        return OrderResult(order_id=str(o.get("id")), raw=o)
 
-        tp_price = float(tp_price)
-        sl_stop_price = float(sl_stop_price)
-        sl_limit_price = float(sl_limit_price) if sl_limit_price is not None else float(sl_stop_price)
+    def create_stop_limit_sell(self, symbol: str, amount: float, stop_price: float, limit_price: float) -> OrderResult:
+        symbol = str(symbol)
+        amount = float(amount)
+        stop_price = float(stop_price)
+        limit_price = float(limit_price)
 
-        logger.info(
-            f"OCO_CREATE | signal_id={signal_id} symbol={symbol} qty={qty} tp={tp_price} sl_stop={sl_stop_price} sl_limit={sl_limit_price}"
-        )
+        try:
+            if hasattr(self.ex, "amount_to_precision"):
+                amount = float(self.ex.amount_to_precision(symbol, amount))
+            if hasattr(self.ex, "price_to_precision"):
+                stop_price = float(self.ex.price_to_precision(symbol, stop_price))
+                limit_price = float(self.ex.price_to_precision(symbol, limit_price))
+        except Exception:
+            pass
 
-        tp = self.exchange.create_limit_sell(symbol, float(qty), float(tp_price))
-        sl = self.exchange.create_stop_limit_sell(symbol, float(qty), float(sl_stop_price), float(sl_limit_price))
+        # Try unified stop_limit
+        try:
+            o = self.ex.create_order(symbol, "stop_limit", "sell", amount, limit_price, {"stopPrice": stop_price})
+            return OrderResult(order_id=str(o.get("id")), raw=o)
+        except Exception as e1:
+            logger.warning(f"STOP_LIMIT_UNIFIED_FAIL | symbol={symbol} err={e1}")
 
-        create_oco_link(
-            signal_id=signal_id,
-            symbol=symbol,
-            base_asset=None,
-            tp_order_id=str(tp.order_id),
-            sl_order_id=str(sl.order_id),
-            tp_price=float(tp_price),
-            sl_stop_price=float(sl_stop_price),
-            sl_limit_price=float(sl_limit_price),
-            amount=float(qty),
-        )
+        # Fallback: limit + stopPrice params (works on many)
+        params = {"stopPrice": stop_price}
+        if self._is_bybit():
+            params["triggerPrice"] = stop_price
 
-        mark_signal_id_executed(
-            signal_id,
-            signal_hash=str(sig.get("signal_hash") or ""),
-            action="EXECUTE",
-            symbol=symbol,
-        )
-        logger.info(f"EXECUTE_DONE | signal_id={signal_id} symbol={symbol}")
-
-    def reconcile_oco(self) -> None:
-        links = list_active_oco_links(limit=50)
-        if not links:
-            return
-
-        for row in links:
-            try:
-                (
-                    link_db_id,
-                    signal_id,
-                    symbol,
-                    base_asset,
-                    tp_order_id,
-                    sl_order_id,
-                    tp_price,
-                    sl_stop_price,
-                    sl_limit_price,
-                    amount,
-                    status,
-                    created_at_utc,
-                    updated_at_utc,
-                ) = row
-            except Exception:
-                logger.warning(f"OCO_ROW_UNPACK_FAIL | row={row}")
-                continue
-
-            tp = None
-            sl = None
-
-            try:
-                tp = self.exchange.fetch_order(str(tp_order_id), str(symbol))
-            except Exception as e:
-                logger.debug(f"OCO_TP_FETCH_FAIL | id={tp_order_id} symbol={symbol} err={e}")
-
-            try:
-                sl = self.exchange.fetch_order(str(sl_order_id), str(symbol))
-            except Exception as e:
-                logger.debug(f"OCO_SL_FETCH_FAIL | id={sl_order_id} symbol={symbol} err={e}")
-
-            tp_status = (tp or {}).get("status")
-            sl_status = (sl or {}).get("status")
-
-            if tp_status == "closed":
-                logger.info(f"OCO_HIT_TP | signal_id={signal_id} symbol={symbol} tp_order={tp_order_id}")
-                try:
-                    if sl_status == "open":
-                        self.exchange.cancel_order(str(sl_order_id), str(symbol))
-                except Exception:
-                    pass
-
-                exit_price = float((tp or {}).get("average") or (tp or {}).get("price") or tp_price or 0.0)
-                close_trade(signal_id=str(signal_id), exit_price=exit_price, outcome="TP", pnl_quote=0.0, pnl_pct=0.0)
-                set_oco_status(int(link_db_id), "closed")
-                continue
-
-            if sl_status == "closed":
-                logger.info(f"OCO_HIT_SL | signal_id={signal_id} symbol={symbol} sl_order={sl_order_id}")
-                try:
-                    if tp_status == "open":
-                        self.exchange.cancel_order(str(tp_order_id), str(symbol))
-                except Exception:
-                    pass
-
-                exit_price = float((sl or {}).get("average") or (sl or {}).get("price") or sl_limit_price or 0.0)
-                close_trade(signal_id=str(signal_id), exit_price=exit_price, outcome="SL", pnl_quote=0.0, pnl_pct=0.0)
-                set_oco_status(int(link_db_id), "closed")
-                continue
+        o = self.ex.create_order(symbol, "limit", "sell", amount, limit_price, params)
+        return OrderResult(order_id=str(o.get("id")), raw=o)
 
 
-# Backward compatibility aliases (so imports won't break if someone used older names)
-execution_engine = ExecutionEngine
-__all__ = ["ExecutionEngine", "execution_engine"]
+def exchange_client() -> ExchangeClient:
+    """
+    Older code expects `exchange_client()` to exist.
+    """
+    exchange_name = (os.getenv("EXCHANGE", "bybit") or "bybit").strip().lower()
+    market_type = (os.getenv("MARKET_TYPE", "spot") or "spot").strip().lower()
+
+    api_key = os.getenv("API_KEY") or os.getenv("EXCHANGE_API_KEY") or ""
+    api_secret = os.getenv("API_SECRET") or os.getenv("EXCHANGE_API_SECRET") or ""
+
+    enable_rate_limit = str(os.getenv("CCXT_ENABLE_RATE_LIMIT", "true")).lower() in ("1", "true", "yes", "y")
+    sandbox = str(os.getenv("SANDBOX", "false")).lower() in ("1", "true", "yes", "y")
+
+    if not hasattr(ccxt, exchange_name):
+        raise RuntimeError(f"Unsupported EXCHANGE='{exchange_name}' (ccxt has no such exchange).")
+
+    ex_cls = getattr(ccxt, exchange_name)
+
+    options: Dict[str, Any] = {}
+    if market_type in ("swap", "future", "futures"):
+        options["defaultType"] = "swap"
+    else:
+        options["defaultType"] = "spot"
+
+    ex = ex_cls(
+        {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": enable_rate_limit,
+            "options": options,
+        }
+    )
+
+    try:
+        if sandbox and hasattr(ex, "set_sandbox_mode"):
+            ex.set_sandbox_mode(True)
+    except Exception as e:
+        logger.warning(f"SANDBOX_MODE_FAIL | exchange={exchange_name} err={e}")
+
+    try:
+        ex.load_markets()
+    except Exception as e:
+        logger.warning(f"LOAD_MARKETS_FAIL | exchange={exchange_name} err={e}")
+
+    logger.info(f"EXCHANGE_CLIENT_READY | exchange={exchange_name} market_type={market_type} sandbox={sandbox}")
+    return ExchangeClient(ex, market_type=market_type)
+
+
+def build_exchange_client() -> ExchangeClient:
+    """
+    Newer code expects `build_exchange_client()` to exist.
+    """
+    return exchange_client()
+
+
+__all__ = ["ExchangeClient", "OrderResult", "exchange_client", "build_exchange_client"]
