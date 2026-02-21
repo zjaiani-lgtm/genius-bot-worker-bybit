@@ -5,7 +5,12 @@ import logging
 from typing import Optional, Dict, Any
 
 from execution.db.db import init_db
-from execution.db.repository import get_system_state, update_system_state, log_event
+from execution.db.repository import (
+    get_system_state,
+    update_system_state,
+    log_event,
+    get_trade_stats,  # ✅ report stats
+)
 from execution.execution_engine import ExecutionEngine
 from execution.signal_client import pop_next_signal
 from execution.kill_switch import is_kill_switch_active
@@ -64,12 +69,47 @@ def _safe_pop_next_signal(outbox_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _run_performance_report_safe() -> None:
+    try:
+        s = get_trade_stats()
+        logger.info(
+            "PERF_REPORT | closed=%s wins=%s losses=%s winrate=%.2f%% roi=%.2f%% pnl=%.4f quote_in=%.4f pf=%.3f",
+            s.get("closed_trades", 0),
+            s.get("wins", 0),
+            s.get("losses", 0),
+            float(s.get("winrate_pct", 0.0)),
+            float(s.get("roi_pct", 0.0)),
+            float(s.get("pnl_quote_sum", 0.0)),
+            float(s.get("quote_in_sum", 0.0)),
+            float(s.get("profit_factor", 0.0)),
+        )
+
+        # optional: store compact snapshot in audit_log
+        try:
+            log_event(
+                "PERF_REPORT",
+                f"closed={s.get('closed_trades',0)} "
+                f"winrate={float(s.get('winrate_pct',0.0)):.2f}% "
+                f"roi={float(s.get('roi_pct',0.0)):.2f}% "
+                f"pnl={float(s.get('pnl_quote_sum',0.0)):.4f}"
+            )
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.warning(f"PERF_REPORT_FAIL | err={e}")
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(asctime)s - %(message)s')
 
     mode = os.getenv("MODE", "DEMO").upper()
     outbox_path = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
     sleep_s = float(os.getenv("LOOP_SLEEP_SECONDS", "10"))
+
+    # ✅ every 60 seconds by default (set REPORT_EVERY_SECONDS=0 to disable)
+    report_every_s = int(os.getenv("REPORT_EVERY_SECONDS", "60"))
+    last_report_ts = 0.0
 
     init_db()
     _bootstrap_state_if_needed()
@@ -86,6 +126,7 @@ def main():
     logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
     logger.info(f"OUTBOX_PATH={outbox_path}")
     logger.info(f"LOOP_SLEEP_SECONDS={sleep_s}")
+    logger.info(f"REPORT_EVERY_SECONDS={report_every_s}")
 
     while True:
         try:
@@ -125,6 +166,12 @@ def main():
                 engine.execute_signal(sig)
             else:
                 logger.info("Worker alive, waiting for SIGNAL_OUTBOX...")
+
+            # 4) ✅ auto performance report
+            now = time.time()
+            if report_every_s > 0 and (now - last_report_ts) >= report_every_s:
+                _run_performance_report_safe()
+                last_report_ts = now
 
         except Exception as e:
             logger.exception(f"WORKER_LOOP_ERROR | err={e}")
