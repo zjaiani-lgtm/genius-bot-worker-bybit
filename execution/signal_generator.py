@@ -208,28 +208,11 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
             f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
         )
 
-    # ============================================================
-# 🔥 ADAPTIVE ATR→TP SANITY (Jaiani Mode)
-# ============================================================
-
-base_factor = ATR_TO_TP_SANITY_FACTOR
-
-# --- volatility multiplier (regime-aware)
-if atr_pct < 0.25:
-    vol_mult = 0.80
-elif atr_pct >= 0.40:
-    vol_mult = 1.15
-else:
-    vol_mult = 1.00
-
-adaptive_factor = base_factor * vol_mult
-required_move = assumed_gross_edge * adaptive_factor
-
-if atr_pct < required_move:
-    return False, (
-        f"ATR_BELOW_TP atr%={atr_pct:.2f} < "
-        f"{adaptive_factor:.2f}*TP_PCT={required_move:.2f}"
-    )
+    if atr_pct < (assumed_gross_edge * ATR_TO_TP_SANITY_FACTOR):
+        return False, (
+            f"ATR_BELOW_TP atr%={atr_pct:.2f} < "
+            f"{ATR_TO_TP_SANITY_FACTOR:.2f}*TP_PCT={assumed_gross_edge*ATR_TO_TP_SANITY_FACTOR:.2f}"
+        )
 
     return True, "OK"
 
@@ -394,17 +377,11 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         struct_soft_ok = False
         struct_soft_reason = ""
         if not struct_ok:
-    struct_soft_ok, struct_soft_reason = _structure_ok_soft(closes, last, ma20, trend)
-
-    if struct_soft_ok:
-        struct_ok = True
-        if GEN_DEBUG:
-            logger.info(
-                f"[GEN] STRUCT_OVERRIDE | symbol={symbol} applied=True reason={struct_soft_reason}"
-            )
-    else:
-        logger.info(f"[GEN] STRUCT_FAIL | symbol={symbol}")  # 🔥 კრიტიკული
-        continue  # 🔥 კრიტიკული
+            struct_soft_ok, struct_soft_reason = _structure_ok_soft(closes, last, ma20, trend)
+            if struct_soft_ok:
+                struct_ok = True
+                if GEN_DEBUG:
+                    logger.info(f"[GEN] STRUCT_OVERRIDE | symbol={symbol} applied=True reason={struct_soft_reason}")
 
         vol_score = _volume_score(vols)
         conf = _confidence_score(closes, ohlcv)
@@ -536,6 +513,3 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
 def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     return generate_signal()
-
-
-
