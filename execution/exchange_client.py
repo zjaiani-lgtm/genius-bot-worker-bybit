@@ -348,6 +348,13 @@ class UnifiedClient:
 def get_exchange_client() -> UnifiedClient:
     return UnifiedClient()
 
+# --- compatibility for newer imports (ExecutionEngine expects this) ---
+def build_exchange_client():
+    return get_exchange_client()
+
+def exchange_client():
+    return get_exchange_client()
 
 # Backward compatibility alias
 BinanceSpotClient = UnifiedClient
+
