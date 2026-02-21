@@ -1,175 +1,221 @@
-# execution/exchange_client.py
+# execution/execution_engine.py
 from __future__ import annotations
 
+import logging
 import os
-import time
-from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-import ccxt
+from execution.exchange_client import build_exchange_client
+from execution.db.repository import (
+    signal_id_already_executed,
+    mark_signal_id_executed,
+    create_oco_link,
+    list_active_oco_links,
+    set_oco_status,
+    has_active_oco_for_symbol,
+    open_trade,
+    close_trade,
+    get_trade,
+)
+
+logger = logging.getLogger("gbm")
 
 
-class ExchangeClientError(Exception):
-    pass
-
-
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name, default)
-    if v is None:
-        return None
-    v = str(v).strip()
-    return v if v else None
-
-
-def _is_true(name: str, default: str = "false") -> bool:
-    return str(os.getenv(name, default)).lower() == "true"
-
-
-@dataclass
-class OrderResult:
-    order_id: str
-    raw: Dict[str, Any]
-
-
-class BaseSpotClient:
+class ExecutionEngine:
     """
-    Minimal spot interface used by ExecutionEngine:
-      - create_market_buy(symbol, quote_amount)
-      - create_market_sell(symbol, base_amount)
-      - create_limit_sell(symbol, base_amount, price)
-      - create_stop_limit_sell(symbol, base_amount, stop_price, limit_price)
-      - cancel_order(order_id, symbol)
-      - fetch_order(order_id, symbol)
-      - fetch_ticker(symbol)
+    Minimal ExecutionEngine that matches your worker/main loop expectations:
+      - execute_signal(sig: dict)
+      - reconcile_oco()
+    Uses exchange client factory (EXCHANGE=bybit, MARKET_TYPE=spot).
     """
 
     def __init__(self):
-        self.exchange = None  # set by subclass
+        self.mode = os.getenv("MODE", "DEMO").upper()
+        self.exchange = build_exchange_client()
 
-    def _sleep_rate(self):
-        time.sleep(0.2)
-
-    def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
-        self._sleep_rate()
-        return self.exchange.fetch_ticker(symbol)
-
-    def fetch_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        self._sleep_rate()
-        return self.exchange.fetch_order(order_id, symbol)
-
-    def cancel_order(self, order_id: str, symbol: str) -> Dict[str, Any]:
-        self._sleep_rate()
-        return self.exchange.cancel_order(order_id, symbol)
-
-    # --- simplified wrappers ---
-    def create_market_buy(self, symbol: str, quote_amount: float) -> OrderResult:
-        self._sleep_rate()
-        # ccxt spot market buy can accept quoteOrderQty on some exchanges; safest is params
-        params = {}
-        # many exchanges support quoteOrderQty; if not, engine should compute base qty.
-        params["quoteOrderQty"] = float(quote_amount)
-        o = self.exchange.create_order(symbol, "market", "buy", None, None, params)
-        return OrderResult(order_id=str(o.get("id")), raw=o)
-
-    def create_market_sell(self, symbol: str, base_amount: float) -> OrderResult:
-        self._sleep_rate()
-        o = self.exchange.create_order(symbol, "market", "sell", float(base_amount), None, {})
-        return OrderResult(order_id=str(o.get("id")), raw=o)
-
-    def create_limit_sell(self, symbol: str, base_amount: float, price: float) -> OrderResult:
-        self._sleep_rate()
-        o = self.exchange.create_order(symbol, "limit", "sell", float(base_amount), float(price), {})
-        return OrderResult(order_id=str(o.get("id")), raw=o)
-
-    def create_stop_limit_sell(
-        self, symbol: str, base_amount: float, stop_price: float, limit_price: float
-    ) -> OrderResult:
+    # ------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------
+    def execute_signal(self, sig: Dict[str, Any]) -> None:
         """
-        Exchange-specific params differ. We'll map for binance/bybit spot.
+        Expects `sig` fields similar to your outbox format:
+          signal_id, symbol, final_verdict, quote_amount, tp_price, sl_stop_price, sl_limit_price, confidence...
         """
-        raise NotImplementedError
+        signal_id = str(sig.get("signal_id") or sig.get("id") or "")
+        symbol = str(sig.get("symbol") or "")
+        verdict = str(sig.get("final_verdict") or sig.get("verdict") or "").upper()
 
+        if not signal_id or not symbol:
+            logger.warning(f"SIGNAL_INVALID | signal_id={signal_id} symbol={symbol}")
+            return
 
-class BinanceSpotClient(BaseSpotClient):
-    def __init__(self):
-        super().__init__()
-        api_key = _env("BINANCE_API_KEY")
-        api_secret = _env("BINANCE_API_SECRET")
+        # idempotency
+        if signal_id_already_executed(signal_id, action="EXECUTE"):
+            logger.info(f"DEDUPED | signal_id={signal_id} action=EXECUTE")
+            return
 
-        mode = str(os.getenv("MODE", "DEMO")).upper()
-        live_or_test = mode in ("LIVE", "TESTNET")
+        # simple safety: avoid double OCO per symbol if enabled by your env logic elsewhere
+        if has_active_oco_for_symbol(symbol):
+            logger.info(f"SKIP | active OCO exists | symbol={symbol}")
+            return
 
-        if live_or_test and (not api_key or not api_secret):
-            raise ExchangeClientError("Missing BINANCE_API_KEY / BINANCE_API_SECRET for LIVE/TESTNET.")
+        if verdict not in ("BUY", "SELL"):
+            # Only executing BUY entries in this simplified engine
+            logger.info(f"SKIP | verdict={verdict} | signal_id={signal_id}")
+            mark_signal_id_executed(signal_id, signal_hash=str(sig.get("signal_hash") or ""), action="SKIP", symbol=symbol)
+            return
 
-        self.exchange = ccxt.binance({
-            "apiKey": api_key or "",
-            "secret": api_secret or "",
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
-        })
+        if verdict == "SELL":
+            # If your system outputs SELL signals for exits, you can implement here.
+            logger.info(f"SKIP_SELL_SIGNAL | signal_id={signal_id} (not implemented)")
+            mark_signal_id_executed(signal_id, signal_hash=str(sig.get("signal_hash") or ""), action="SKIP_SELL", symbol=symbol)
+            return
 
-        # Binance spot testnet is not fully supported via ccxt in all cases; keep off unless you know it works.
-        # If you do use testnet, you'd set urls manually here.
+        quote_amount = float(sig.get("quote_amount") or sig.get("quote_in") or 0.0)
+        if quote_amount <= 0:
+            # fallback to BOT_QUOTE_PER_TRADE
+            quote_amount = float(os.getenv("BOT_QUOTE_PER_TRADE", "7"))
 
-    def create_stop_limit_sell(self, symbol: str, base_amount: float, stop_price: float, limit_price: float) -> OrderResult:
-        self._sleep_rate()
-        params = {"stopPrice": float(stop_price)}
-        o = self.exchange.create_order(symbol, "limit", "sell", float(base_amount), float(limit_price), params)
-        return OrderResult(order_id=str(o.get("id")), raw=o)
+        # 1) Market BUY (best-effort quoteOrderQty param inside client)
+        logger.info(f"EXECUTE_BUY | signal_id={signal_id} symbol={symbol} quote={quote_amount}")
+        buy = self.exchange.create_market_buy(symbol, quote_amount)
 
+        # Try to infer entry price from order or ticker
+        entry_price = None
+        try:
+            # ccxt order structure varies; try common fields
+            entry_price = float(buy.raw.get("average") or buy.raw.get("price") or 0.0) or None
+        except Exception:
+            entry_price = None
 
-class BybitSpotClient(BaseSpotClient):
-    def __init__(self):
-        super().__init__()
-        api_key = _env("BYBIT_API_KEY")
-        api_secret = _env("BYBIT_API_SECRET")
+        if entry_price is None:
+            try:
+                t = self.exchange.fetch_ticker(symbol)
+                entry_price = float(t.get("last") or 0.0) or 0.0
+            except Exception:
+                entry_price = 0.0
 
-        mode = str(os.getenv("MODE", "DEMO")).upper()
-        live_or_test = mode in ("LIVE", "TESTNET")
+        # Qty: if exchange returns filled amount, use it; else approximate
+        qty = None
+        try:
+            qty = float(buy.raw.get("filled") or buy.raw.get("amount") or 0.0) or None
+        except Exception:
+            qty = None
 
-        if live_or_test and (not api_key or not api_secret):
-            raise ExchangeClientError("Missing BYBIT_API_KEY / BYBIT_API_SECRET for LIVE/TESTNET.")
+        if qty is None or qty <= 0:
+            # approximate qty
+            qty = (quote_amount / entry_price) if entry_price > 0 else 0.0
 
-        self.exchange = ccxt.bybit({
-            "apiKey": api_key or "",
-            "secret": api_secret or "",
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
-        })
+        # 2) Store trade open
+        open_trade(signal_id=signal_id, symbol=symbol, qty=float(qty), quote_in=float(quote_amount), entry_price=float(entry_price))
 
-        # Bybit testnet: ccxt supports "testnet" via urls for some markets.
-        # We'll only enable if user sets BYBIT_TESTNET=true
-        if _is_true("BYBIT_TESTNET", "false"):
-            self.exchange.set_sandbox_mode(True)
+        # 3) Create OCO (TP + SL)
+        tp_price = sig.get("tp_price")
+        sl_stop_price = sig.get("sl_stop_price")
+        sl_limit_price = sig.get("sl_limit_price")
 
-    def create_stop_limit_sell(self, symbol: str, base_amount: float, stop_price: float, limit_price: float) -> OrderResult:
-        self._sleep_rate()
-        # Bybit spot conditional orders are exchange-specific; ccxt may require params.
-        # This is a best-effort mapping:
-        params = {
-            "stopPrice": float(stop_price),
-            # some bybit implementations accept "triggerPrice"
-            "triggerPrice": float(stop_price),
-        }
-        o = self.exchange.create_order(symbol, "limit", "sell", float(base_amount), float(limit_price), params)
-        return OrderResult(order_id=str(o.get("id")), raw=o)
+        # If your model uses pct, you can compute here; otherwise require explicit prices.
+        if tp_price is None or sl_stop_price is None:
+            logger.warning(f"OCO_SKIP | missing tp/sl prices | signal_id={signal_id}")
+            mark_signal_id_executed(signal_id, signal_hash=str(sig.get("signal_hash") or ""), action="EXECUTE", symbol=symbol)
+            return
 
+        tp_price = float(tp_price)
+        sl_stop_price = float(sl_stop_price)
+        sl_limit_price = float(sl_limit_price) if sl_limit_price is not None else float(sl_stop_price)
 
-def build_exchange_client() -> BaseSpotClient:
-    """
-    Factory: chooses exchange based on ENV EXCHANGE.
-    Supported: bybit, binance (default).
-    """
-    ex = str(os.getenv("EXCHANGE", "binance")).strip().lower()
-    market = str(os.getenv("MARKET_TYPE", "spot")).strip().lower()
+        logger.info(
+            f"OCO_CREATE | signal_id={signal_id} symbol={symbol} qty={qty} tp={tp_price} sl_stop={sl_stop_price} sl_limit={sl_limit_price}"
+        )
 
-    if market != "spot":
-        # your worker currently is spot-based; keep strict
-        raise ExchangeClientError(f"Unsupported MARKET_TYPE={market}. Only spot is supported in this worker.")
+        tp = self.exchange.create_limit_sell(symbol, float(qty), float(tp_price))
+        sl = self.exchange.create_stop_limit_sell(symbol, float(qty), float(sl_stop_price), float(sl_limit_price))
 
-    if ex == "bybit":
-        return BybitSpotClient()
+        create_oco_link(
+            signal_id=signal_id,
+            symbol=symbol,
+            base_asset=None,
+            tp_order_id=str(tp.order_id),
+            sl_order_id=str(sl.order_id),
+            tp_price=float(tp_price),
+            sl_stop_price=float(sl_stop_price),
+            sl_limit_price=float(sl_limit_price),
+            amount=float(qty),
+        )
 
-    # default
-    return BinanceSpotClient()
+        mark_signal_id_executed(signal_id, signal_hash=str(sig.get("signal_hash") or ""), action="EXECUTE", symbol=symbol)
+        logger.info(f"EXECUTE_DONE | signal_id={signal_id} symbol={symbol}")
+
+    def reconcile_oco(self) -> None:
+        """
+        Checks active oco_links and closes trades if TP/SL filled.
+        Very defensive: if fetch_order fails, we keep link open.
+        """
+        links = list_active_oco_links(limit=50)
+        if not links:
+            return
+
+        for row in links:
+            try:
+                (
+                    link_db_id,
+                    signal_id,
+                    symbol,
+                    base_asset,
+                    tp_order_id,
+                    sl_order_id,
+                    tp_price,
+                    sl_stop_price,
+                    sl_limit_price,
+                    amount,
+                    status,
+                    created_at_utc,
+                    updated_at_utc,
+                ) = row
+            except Exception:
+                logger.warning(f"OCO_ROW_UNPACK_FAIL | row={row}")
+                continue
+
+            # fetch both orders
+            tp = None
+            sl = None
+            try:
+                tp = self.exchange.fetch_order(str(tp_order_id), str(symbol))
+            except Exception as e:
+                logger.debug(f"OCO_TP_FETCH_FAIL | id={tp_order_id} symbol={symbol} err={e}")
+
+            try:
+                sl = self.exchange.fetch_order(str(sl_order_id), str(symbol))
+            except Exception as e:
+                logger.debug(f"OCO_SL_FETCH_FAIL | id={sl_order_id} symbol={symbol} err={e}")
+
+            tp_status = (tp or {}).get("status")
+            sl_status = (sl or {}).get("status")
+
+            # ccxt statuses: 'open' / 'closed' / 'canceled'
+            if tp_status == "closed":
+                logger.info(f"OCO_HIT_TP | signal_id={signal_id} symbol={symbol} tp_order={tp_order_id}")
+                try:
+                    # cancel SL if still open
+                    if sl_status == "open":
+                        self.exchange.cancel_order(str(sl_order_id), str(symbol))
+                except Exception:
+                    pass
+
+                exit_price = float((tp or {}).get("average") or (tp or {}).get("price") or tp_price or 0.0)
+                close_trade(signal_id=str(signal_id), exit_price=exit_price, outcome="TP", pnl_quote=0.0, pnl_pct=0.0)
+                set_oco_status(int(link_db_id), "closed")
+                continue
+
+            if sl_status == "closed":
+                logger.info(f"OCO_HIT_SL | signal_id={signal_id} symbol={symbol} sl_order={sl_order_id}")
+                try:
+                    if tp_status == "open":
+                        self.exchange.cancel_order(str(tp_order_id), str(symbol))
+                except Exception:
+                    pass
+
+                exit_price = float((sl or {}).get("average") or (sl or {}).get("price") or sl_limit_price or 0.0)
+                close_trade(signal_id=str(signal_id), exit_price=exit_price, outcome="SL", pnl_quote=0.0, pnl_pct=0.0)
+                set_oco_status(int(link_db_id), "closed")
+                continue
