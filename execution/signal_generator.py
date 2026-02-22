@@ -49,15 +49,19 @@ GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == 
 GEN_LOG_REASONS = os.getenv("GEN_LOG_REASONS", "true").strip().lower() == "true"
 GEN_LOG_LOCAL_GATES = os.getenv("GEN_LOG_LOCAL_GATES", "true").strip().lower() == "true"
 
+# NEW: deep diagnostics
+GEN_LOG_DIAGNOSTICS = os.getenv("GEN_LOG_DIAGNOSTICS", "true").strip().lower() == "true"
+GEN_LOG_THRESHOLDS_ONCE = os.getenv("GEN_LOG_THRESHOLDS_ONCE", "true").strip().lower() == "true"
+
 # -----------------------------
-# VOLUME RECALIBRATION (already working for SOL)
+# VOLUME RECALIBRATION
 # -----------------------------
 VOLUME_SCORE_SCALE = float(os.getenv("VOLUME_SCORE_SCALE", "2.5"))
 VOLUME_SCORE_FLOOR = float(os.getenv("VOLUME_SCORE_FLOOR", "0.20"))
 VOLUME_SCORE_CAP = float(os.getenv("VOLUME_SCORE_CAP", "1.00"))
 
 # -----------------------------
-# STRUCTURE SOFT OVERRIDE (NEW KEY FIX)
+# STRUCTURE SOFT OVERRIDE
 # -----------------------------
 STRUCT_SOFT_OVERRIDE = os.getenv("STRUCT_SOFT_OVERRIDE", "true").strip().lower() == "true"
 STRUCT_SOFT_MIN_TREND = float(os.getenv("STRUCT_SOFT_MIN_TREND", "0.68"))
@@ -69,7 +73,6 @@ if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
     EXCEL_MODEL_PATH = EXCEL_MODEL_PATH.split("=", 1)[1].strip()
 
 _last_emit_ts: float = 0.0
-_last_signature: Optional[Tuple[str, str]] = None
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
@@ -81,6 +84,7 @@ EXCHANGE = ccxt.binance({
 })
 
 _CORE: Optional[ExcelLiveCore] = None
+_THRESHOLDS_LOGGED = False
 
 
 def _now_utc_iso() -> str:
@@ -140,7 +144,7 @@ def _resolve_excel_path(env_path: str) -> str:
 
 
 def _core() -> ExcelLiveCore:
-    global _CORE
+    global _CORE, _THRESHOLDS_LOGGED
     if _CORE is None:
         resolved = _resolve_excel_path(EXCEL_MODEL_PATH)
         logger.info(
@@ -148,12 +152,29 @@ def _core() -> ExcelLiveCore:
         )
         _CORE = ExcelLiveCore(resolved)
         logger.info(f"[GEN] EXCEL_CORE_LOADED | path={resolved}")
+
+    # Log core thresholds/weights once for debugging
+    if _CORE is not None and GEN_LOG_THRESHOLDS_ONCE and not _THRESHOLDS_LOGGED:
         try:
-            v = getattr(__import__("execution.excel_live_core", fromlist=["CORE_VERSION"]), "CORE_VERSION", None)
-            if v:
-                logger.info(f"[GEN] EXCEL_CORE_VERSION | version={v}")
-        except Exception:
-            pass
+            th = _CORE.thresholds or {}
+            w = _CORE.weights or {}
+            trend_th = (th.get("trend strength", {}) or {}).get("num")
+            vol_th = (th.get("volume confirmation", {}) or {}).get("num")
+            conf_th = (th.get("confidence score", {}) or {}).get("num")
+            logger.info(
+                "[GEN] CORE_THRESHOLDS | "
+                f"trend_th={trend_th} vol_th={vol_th} conf_th={conf_th} "
+                f"softVol(enabled={_CORE.enable_soft_volume_override} ai_min={_CORE.soft_volume_ai_min} relax={_CORE.soft_volume_relax} requireVolBand={_CORE.soft_volume_require_volband})"
+            )
+            logger.info(
+                "[GEN] CORE_WEIGHTS | "
+                f"trend={w.get('trend strength')} struct={w.get('structure validation')} volconf={w.get('volume confirmation')} "
+                f"risk={w.get('risk state modifier')} conf={w.get('confidence score')} volReg={w.get('volatility regime')}"
+            )
+        except Exception as e:
+            logger.warning(f"[GEN] CORE_THRESHOLDS_LOG_FAIL | err={e}")
+        _THRESHOLDS_LOGGED = True
+
     return _CORE
 
 
@@ -285,16 +306,22 @@ def _volume_score(vols: List[float]) -> float:
     return max(0.0, min(VOLUME_SCORE_CAP, floored))
 
 
-def _confidence_score(closes: List[float], ohlcv: List[List[float]]) -> float:
+def _confidence_components(closes: List[float], ohlcv: List[List[float]]) -> Tuple[float, int, int, int]:
     last = closes[-1]
     prev = closes[-2]
     ma20 = _sma(closes, 20)
     atrp = _atr_pct(ohlcv, 14)
 
-    cond1 = 1.0 if last > ma20 else 0.0
-    cond2 = 1.0 if last > prev else 0.0
-    cond3 = 1.0 if atrp < 2.0 else 0.0
-    return (0.45 * cond1) + (0.35 * cond2) + (0.20 * cond3)
+    cond1 = 1 if last > ma20 else 0
+    cond2 = 1 if last > prev else 0
+    cond3 = 1 if atrp < 2.0 else 0
+    score = (0.45 * cond1) + (0.35 * cond2) + (0.20 * cond3)
+    return score, cond1, cond2, cond3
+
+
+def _confidence_score(closes: List[float], ohlcv: List[List[float]]) -> float:
+    score, _, _, _ = _confidence_components(closes, ohlcv)
+    return score
 
 
 def _risk_state(vol_regime: str, ai_score: float) -> str:
@@ -332,6 +359,70 @@ def _log_local_gates(symbol: str, *, active_oco: bool, cooldown_ok: bool, allow_
     )
 
 
+def _diagnostic_dump(symbol: str, *, last: float, prev: float, ma20: float, atrp: float,
+                     trend: float, vol_score: float, vol_raw: float,
+                     conf: float, c1: int, c2: int, c3: int,
+                     struct_strict: bool, struct_soft_ok: bool, struct_soft_reason: str,
+                     decision: Dict[str, Any], outbox_path: str) -> None:
+    if not GEN_LOG_DIAGNOSTICS:
+        return
+
+    gap_pct = _pct(last, ma20)
+    ma_gap_abs = abs(gap_pct)
+    ok_edge, edge_reason = _edge_ok(atrp)
+
+    # If we can infer thresholds from core, log them (best-effort)
+    trend_th = None
+    conf_th = None
+    vol_th = None
+    try:
+        core = _core()
+        th = getattr(core, "thresholds", {}) or {}
+        trend_th = (th.get("trend strength", {}) or {}).get("num")
+        conf_th = (th.get("confidence score", {}) or {}).get("num")
+        vol_th = (th.get("volume confirmation", {}) or {}).get("num")
+    except Exception:
+        pass
+
+    # Why not execute (human readable)
+    active = decision.get("active_strategy")
+    final = decision.get("final_trade_decision")
+    ai = float(decision.get("ai_score", 0.0))
+    macro = decision.get("macro_gate")
+    reasons = decision.get("reasons") or {}
+
+    blockers = []
+    if reasons.get("trend_ok") is False:
+        blockers.append("trend_ok=FALSE")
+    if reasons.get("confidence_ok") is False:
+        blockers.append("confidence_ok=FALSE")
+    if reasons.get("volume_ok") is False:
+        blockers.append("volume_ok=FALSE")
+    if reasons.get("volband_ok") is False:
+        blockers.append("volband_ok=FALSE")
+    if reasons.get("risk_ok") is False:
+        blockers.append("risk_ok=FALSE")
+    if macro != "ALLOW":
+        blockers.append(f"macro_gate={macro}")
+    if active != "YES":
+        blockers.append(f"active_strategy={active}")
+    if final != "EXECUTE":
+        blockers.append(f"final={final}")
+    if ai <= 0.60:
+        blockers.append(f"ai_score={ai:.3f}<=0.60")
+
+    logger.info(
+        "[GEN] DIAG | "
+        f"symbol={symbol} last={last:.6f} prev={prev:.6f} ma20={ma20:.6f} gap%={gap_pct:.3f} ma_gap_abs={ma_gap_abs:.3f} "
+        f"atr%={atrp:.2f} edge_ok={ok_edge} edge_reason={edge_reason} "
+        f"trend={trend:.3f} trend_th={trend_th} "
+        f"conf={conf:.3f} conf_th={conf_th} c1(last>ma20)={c1} c2(last>prev)={c2} c3(atr<2)={c3} "
+        f"vol_raw={vol_raw:.3f} vol_score={vol_score:.3f} vol_th={vol_th} "
+        f"struct_strict={struct_strict} struct_soft={struct_soft_ok} struct_soft_reason={struct_soft_reason} "
+        f"ai={ai:.3f} macro={macro} active={active} final={final} blockers={blockers} outbox={outbox_path}"
+    )
+
+
 def generate_signal() -> Optional[Dict[str, Any]]:
     outbox_path = _get_outbox_path()
 
@@ -364,6 +455,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         closes = [float(c[4]) for c in ohlcv]
         vols = [float(c[5]) for c in ohlcv]
         last = closes[-1]
+        prev = closes[-2]
         ma20 = _sma(closes, 20)
         atrp = _atr_pct(ohlcv, 14)
         vol_reg = _vol_regime(atrp)
@@ -371,7 +463,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         trend = _trend_strength(last, ma20)
 
         # strict structure first
-        struct_ok = _structure_ok_strict(closes)
+        struct_strict = _structure_ok_strict(closes)
+        struct_ok = struct_strict
 
         # SOFT structure override if strict fails
         struct_soft_ok = False
@@ -383,9 +476,12 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 if GEN_DEBUG:
                     logger.info(f"[GEN] STRUCT_OVERRIDE | symbol={symbol} applied=True reason={struct_soft_reason}")
 
+        vol_raw = _volume_score_raw(vols)
         vol_score = _volume_score(vols)
-        conf = _confidence_score(closes, ohlcv)
 
+        conf, c1, c2, c3 = _confidence_components(closes, ohlcv)
+
+        # First pass AI score with risk_state="OK" (like your original)
         tmp_inp = CoreInputs(
             trend_strength=trend,
             structure_ok=struct_ok,
@@ -395,9 +491,9 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             volatility_regime=vol_reg,
         )
         tmp_dec = core.decide(tmp_inp)
-        ai_score = float(tmp_dec.get("ai_score", 0.0))
+        ai_score_pre = float(tmp_dec.get("ai_score", 0.0))
 
-        risk = _risk_state(vol_reg, ai_score)
+        risk = _risk_state(vol_reg, ai_score_pre)
 
         inp = CoreInputs(
             trend_strength=trend,
@@ -419,9 +515,26 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         if GEN_DEBUG and GEN_LOG_REASONS:
             try:
-                logger.info(f"[GEN] STRAT_REASONS | symbol={symbol} reasons={decision.get('reasons')}")
+                # Also include structure_ok for clarity
+                rs = decision.get("reasons") or {}
+                rs = dict(rs)
+                rs["structure_ok"] = bool(struct_ok)
+                rs["structure_strict_ok"] = bool(struct_strict)
+                rs["structure_soft_ok"] = bool(struct_soft_ok)
+                rs["structure_soft_reason"] = struct_soft_reason
+                logger.info(f"[GEN] STRAT_REASONS | symbol={symbol} reasons={rs}")
             except Exception as e:
                 logger.warning(f"[GEN] STRAT_REASONS_FAIL | symbol={symbol} err={e}")
+
+        # Deep diag line (why blocked)
+        _diagnostic_dump(
+            symbol,
+            last=last, prev=prev, ma20=ma20, atrp=atrp,
+            trend=trend, vol_score=vol_score, vol_raw=vol_raw,
+            conf=conf, c1=c1, c2=c2, c3=c3,
+            struct_strict=struct_strict, struct_soft_ok=struct_soft_ok, struct_soft_reason=struct_soft_reason,
+            decision=decision, outbox_path=outbox_path
+        )
 
         if active_oco and risk == "KILL":
             signal_id = str(uuid.uuid4())
