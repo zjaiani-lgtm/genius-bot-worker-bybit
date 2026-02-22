@@ -212,6 +212,8 @@ class ExcelLiveCore:
     # ============================================================
 
     def decide(self, inp: CoreInputs) -> Dict[str, Any]:
+        print("🔥 AI GATE VERSION = 0.52 🔥")
+
         ai_score = self._score(inp)
         macro_gate = self._macro_gate(inp)
 
@@ -259,4 +261,3 @@ class ExcelLiveCore:
                 "volatility_table_loaded": bool(self.volatility_table),
             },
         }
-
