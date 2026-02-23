@@ -552,6 +552,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # Protective SELL if active OCO and risk is KILL
         # Protective SELL if active OCO and risk is KILL
 # Protective SELL if active OCO and risk is KILL
+# Protective SELL if active OCO and risk is KILL
 if active_oco and str(risk).upper() == "KILL":
     signal_id = str(uuid.uuid4())
     logger.info(f"[SIG] symbol={symbol}")
@@ -641,5 +642,6 @@ if active_oco and str(risk).upper() == "KILL":
 
 def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     return generate_signal()
+
 
 
