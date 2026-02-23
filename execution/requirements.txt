@@ -2,3 +2,4 @@ ccxt
 pandas
 xlwings
 python-dotenv
+openpyxl
