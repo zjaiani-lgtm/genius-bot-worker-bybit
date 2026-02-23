@@ -13,6 +13,33 @@ from execution.db.repository import has_active_oco_for_symbol
 from execution.excel_live_core import ExcelLiveCore, CoreInputs
 
 logger = logging.getLogger("gbm")
+# ==============================
+# EXCEL BRIDGE READER
+# ==============================
+def _read_excel_bridge(core: ExcelLiveCore) -> dict:
+    """
+    Read values from Excel PYTHON_BRIDGE.
+    Safe: returns {} on any failure.
+    """
+    try:
+        wb = getattr(core, "workbook", None)
+        if wb is None:
+            return {}
+
+        if "PYTHON_BRIDGE" not in wb.sheetnames:
+            return {}
+
+        ws = wb["PYTHON_BRIDGE"]
+
+        out = {}
+        for r in range(2, ws.max_row + 1):
+            key = ws.cell(r, 1).value
+            val = ws.cell(r, 2).value
+            if key:
+                out[str(key)] = val
+        return out
+    except Exception:
+        return {}
 
 # -----------------------------
 # ENV
@@ -609,3 +636,4 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
 def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     return generate_signal()
+
