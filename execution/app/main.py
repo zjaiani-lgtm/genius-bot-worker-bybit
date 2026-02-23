@@ -1,43 +1,107 @@
+from __future__ import annotations
+
 import time
-from app.config import settings
-from app.logger import get_logger
-from app.exchange import get_exchange
-from app.signal_engine import generate_signal
-from app.order_executor import execute_signal
-from app.cooldown_manager import CooldownManager
-from app.kill_switch import KillSwitch
 
-logger = get_logger(__name__)
+from .config import load_config
+from .cooldown_manager import CooldownManager
+from .data_fetcher import fetch_market_data
+from .excel_bridge import ExcelBridge
+from .exchange import init_exchange
+from .exchange_health import check_exchange_health
+from .indicators import compute_indicators
+from .kill_switch import KillSwitch
+from .logger import bootstrap_logger, log
+from .order_executor import OrderExecutor
+from .position_manager import PositionManager
+from .risk_manager import build_risk_plan
+from .signal_engine import SignalEngine
 
-def run():
-    logger.info("🥋 Mr. JAIANI starting...")
-    exchange = get_exchange()
-    cooldown = CooldownManager()
-    kill_switch = KillSwitch()
+
+def run() -> None:
+    logger = bootstrap_logger("genius_bot")
+    cfg = load_config()
+
+    log(logger, "INFO", "BOOT", symbols=",".join(cfg.symbols), tf=cfg.timeframe, dry_run=cfg.dry_run, allow_live=cfg.allow_live_signals)
+    ex = init_exchange(cfg, logger)
+
+    excel = ExcelBridge(
+        path=cfg.excel_path,
+        sheet=cfg.excel_sheet,
+        in_prefix=cfg.excel_named_inputs_prefix,
+        out_prefix=cfg.excel_named_outputs_prefix,
+        logger=logger,
+    )
+
+    cooldown = CooldownManager(cfg.cooldown_seconds, cfg.post_loss_cooldown_seconds)
+    kill = KillSwitch(cfg.max_drawdown, cfg.max_loss_streak, logger)
+    posman = PositionManager(ex, logger)
+    executor = OrderExecutor(ex, logger, dry_run=cfg.dry_run)
+    signal_engine = SignalEngine(excel, logger)
+
+    last_report = 0.0
 
     while True:
+        health = check_exchange_health(ex, logger)
+        if not health.ok:
+            log(logger, "WARNING", "EXCHANGE_UNHEALTHY", reason=health.reason)
+            time.sleep(cfg.loop_sleep_seconds)
+            continue
+
+        bal = ex.fetch_balance_safe()
+        equity = 0.0
         try:
-            if kill_switch.should_halt():
-                logger.warning("🚨 Kill switch active — sleeping")
-                time.sleep(30)
+            equity = float(bal.get("total", {}).get("USDT") or bal.get("USDT", {}).get("total") or 0.0)
+        except Exception:
+            equity = 0.0
+
+        if kill.blocked(equity=equity):
+            log(logger, "ERROR", "KILL_SWITCH_ACTIVE", equity=equity)
+            time.sleep(max(30.0, cfg.loop_sleep_seconds))
+            continue
+
+        open_count = posman.open_positions_count()
+        for symbol in cfg.symbols:
+            if open_count >= cfg.max_open_positions:
+                break
+            if posman.has_position(symbol):
+                continue
+            if not cooldown.allowed(symbol):
                 continue
 
-            for symbol in settings.SYMBOLS:
-                if cooldown.in_cooldown(symbol):
-                    continue
+            md = fetch_market_data(ex, symbol, cfg.timeframe, cfg.ohlcv_limit, logger)
+            ind = compute_indicators(md.df)
+            if ind is None:
+                continue
 
-                signal = generate_signal(exchange, symbol)
-                if signal is None:
-                    continue
+            sig = signal_engine.generate(symbol, cfg.timeframe, ind)
+            if sig.decision == "NO":
+                continue
 
-                execute_signal(exchange, symbol, signal)
-                cooldown.mark_trade(symbol)
+            if not cfg.allow_live_signals:
+                log(logger, "INFO", "SIGNAL_BLOCKED_ALLOW_LIVE_FALSE", symbol=symbol, decision=sig.decision, conf=sig.confidence)
+                continue
 
-            time.sleep(settings.LOOP_INTERVAL)
+            plan = build_risk_plan(
+                side=sig.decision,
+                last=ind.last,
+                atr_pct=ind.atr_pct,
+                quote_per_trade=cfg.quote_per_trade,
+                fixed_amount=cfg.position_size,
+            )
+            if not plan:
+                continue
 
-        except Exception as e:
-            logger.exception(f"Main loop error: {e}")
-            time.sleep(10)
+            res = executor.place_bracket_market(symbol, sig.decision, plan.amount, plan.sl, plan.tp)
+            if res.ok:
+                cooldown.mark_signal(symbol)
+                open_count += 1
+
+        if time.time() - last_report > cfg.report_every_seconds:
+            log(logger, "INFO", "HEARTBEAT", equity=equity, open_positions=open_count)
+            last_report = time.time()
+
+        time.sleep(cfg.loop_sleep_seconds)
+
 
 if __name__ == "__main__":
     run()
