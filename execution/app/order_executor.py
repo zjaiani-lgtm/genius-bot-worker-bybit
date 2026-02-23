@@ -1,53 +1,52 @@
-from app.logger import get_logger
-from app.exchange import create_order_safe, fetch_balance_safe
-from app.config import settings
-from app.risk_manager import calc_position_size
+from __future__ import annotations
 
-logger = get_logger(__name__)
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
-def _round_amount(exchange, symbol, amount):
-    try:
-        return float(exchange.amount_to_precision(symbol, amount))
-    except Exception:
-        return amount
+from .logger import log
 
-def _get_min_notional(exchange, symbol):
-    try:
-        market = exchange.market(symbol)
-        limits = market.get("limits", {})
-        cost = limits.get("cost", {})
-        return cost.get("min")
-    except Exception:
-        return None
 
-def execute_signal(exchange, symbol, signal):
-    side = "buy" if signal["action"] == "BUY" else "sell"
+@dataclass
+class OrderResult:
+    ok: bool
+    entry_order: Optional[Dict[str, Any]]
+    sl_order: Optional[Dict[str, Any]]
+    tp_order: Optional[Dict[str, Any]]
+    error: Optional[str] = None
 
-    # --- balance aware sizing ---
-    try:
-        balance = fetch_balance_safe(exchange)
-        usdt_balance = balance.get("total", {}).get("USDT", 0)
-    except Exception:
-        usdt_balance = 0
 
-    price = signal.get("price") or signal.get("last_price") or 1
-    stop_distance = signal.get("stop_distance") or (price * 0.01)
+class OrderExecutor:
+    def __init__(self, ex, logger, dry_run: bool = True):
+        self.ex = ex
+        self.logger = logger
+        self.dry_run = dry_run
 
-    min_notional = _get_min_notional(exchange, symbol)
+    def place_bracket_market(self, symbol: str, side: str, amount: float, sl: float, tp: float) -> OrderResult:
+        side = side.upper()
+        if side not in ("BUY", "SELL"):
+            return OrderResult(False, None, None, None, "invalid_side")
 
-    raw_size = calc_position_size(
-        balance=usdt_balance,
-        risk_per_trade=settings.RISK_PER_TRADE,
-        stop_distance=stop_distance,
-        min_notional=min_notional,
-        price=price,
-    )
+        if self.dry_run:
+            log(self.logger, "INFO", "DRY_RUN_ORDER", symbol=symbol, side=side, amount=amount, sl=sl, tp=tp)
+            return OrderResult(True, entry_order={"dry_run": True}, sl_order=None, tp_order=None)
 
-    amount = _round_amount(exchange, symbol, raw_size)
+        try:
+            entry = self.ex.create_order_safe(symbol, "market", side.lower(), amount, None, params={})
+            if not entry:
+                return OrderResult(False, None, None, None, "entry_failed")
 
-    if amount <= 0:
-        logger.warning("Calculated order size is zero — skipping trade")
-        return
+            sl_order = None
+            tp_order = None
 
-    logger.info(f"Executing {side} on {symbol} size={amount}")
-    create_order_safe(exchange, symbol, "market", side, amount)
+            # Fallback separate reduce-only orders
+            opp = "sell" if side == "BUY" else "buy"
+
+            tp_order = self.ex.create_order_safe(symbol, "limit", opp, amount, tp, params={"reduceOnly": True})
+            sl_params = {"reduceOnly": True, "stopPrice": sl}
+            sl_order = self.ex.create_order_safe(symbol, "stop_market", opp, amount, None, params=sl_params)
+
+            log(self.logger, "INFO", "BRACKET_PLACED", symbol=symbol, side=side, amount=amount, sl=sl, tp=tp)
+            return OrderResult(True, entry, sl_order, tp_order, None)
+        except Exception as e:
+            log(self.logger, "ERROR", "ORDER_EXEC_FAIL", symbol=symbol, error=str(e))
+            return OrderResult(False, None, None, None, str(e))
