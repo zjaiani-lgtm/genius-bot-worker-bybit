@@ -550,27 +550,32 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 )
 
         # Protective SELL if active OCO and risk is KILL
-        if active_oco and risk == "KILL":
-            signal_id = str(uuid.uuid4())
-            sig = {
-                "signal_id": signal_id,
-                "ts_utc": _now_utc_iso(),
-                "certified_signal": True,
-                "final_verdict": "SELL",
-                "meta": {
-                    "source": "DYZEN_EXCEL_LIVE_CORE",
-                    "symbol": symbol,
-                    "reason": "RISK_KILL_OVERRIDE",
-                    "decision": decision,
-                },
-                "execution": {
-                    "symbol": symbol,
-                    "direction": "LONG",
-                    "entry": {"type": "MARKET"},
-                }
-            }
-            _emit(sig, outbox_path)
-            return sig
+        # Protective SELL if active OCO and risk is KILL
+# Protective SELL if active OCO and risk is KILL
+if active_oco and str(risk).upper() == "KILL":
+    signal_id = str(uuid.uuid4())
+    logger.info(f"[SIG] symbol={symbol}")
+
+    sig = {
+        "signal_id": signal_id,
+        "ts_utc": _now_utc_iso(),
+        "certified_signal": True,
+        "final_verdict": "SELL",
+        "meta": {
+            "source": "DYZEN_EXCEL_LIVE_CORE",
+            "symbol": symbol,
+            "reason": "RISK_KILL_OVERRIDE",
+            "decision": decision,
+        },
+        "execution": {
+            "symbol": symbol,
+            "direction": "LONG",
+            "entry": {"type": "MARKET"},
+        },
+    }
+
+    _emit(sig, outbox_path)
+    return sig
 
         if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO:
             continue
@@ -636,4 +641,5 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
 def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     return generate_signal()
+
 
