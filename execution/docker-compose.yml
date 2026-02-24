@@ -1,5 +1,0 @@
-version: '3'
-services:
-  mr_jaiani:
-    build: .
-    container_name: mr_jaiani_bot
